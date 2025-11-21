@@ -32,6 +32,14 @@ from .picking import (
     smooth_picks_median,
 )
 
+# Travel time functions
+from .travel_times import (
+    calculate_travel_times,
+    get_theoretical_picks,
+    load_event_from_csv,
+    travel_times_to_samples,
+)
+
 __all__ = [
     # Picking
     "polynomial_regression_ransac",
@@ -50,4 +58,9 @@ __all__ = [
     "cross_correlate_channels",
     "refine_picks_with_mccc",
     "calculate_coherency",
+    # Travel times
+    "calculate_travel_times",
+    "get_theoretical_picks",
+    "load_event_from_csv",
+    "travel_times_to_samples",
 ]
