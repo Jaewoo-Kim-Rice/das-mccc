@@ -14,19 +14,62 @@ from .filtering import moving_avg
 from .array_ops import shift_arr, tau_shift
 
 
-def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False):
+def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothness=0.0):
+    """
+    Multi-channel cross-correlation with optional smoothness regularization.
 
+    Parameters
+    ----------
+    shifted_arr : ndarray
+        Shifted waveform array
+    corr_len : int
+        Correlation window length
+    max_shift : int
+        Maximum allowed shift
+    lamb : float
+        Regularization parameter for cross-correlation
+    avg_win : int
+        Moving average window size
+    pad : bool
+        Whether to pad the array
+    smoothness : float
+        Smoothness regularization parameter. Higher values enforce smoother
+        shifts between adjacent channels. Typical values: 0.1-10.0
+        Based on physical constraint: adjacent channels (5m apart) should not
+        differ by more than ~1ms at 5000 m/s max velocity.
+
+    Returns
+    -------
+    tau : ndarray
+        Time shifts for each channel, shape (n_channels, 2)
+    """
     #Padding
     if pad:
         pad_size = 300
         padding_arr = shifted_arr[-pad_size:]
         shifted_arr = np.concatenate((shifted_arr, padding_arr[::-1]))
     Diff, taus = get_diff_corr(shifted_arr, corr_len=corr_len, max_shift=max_shift)
-    # Inversion
-    M = np.vstack([lamb*Diff])
-    b  = np.concatenate([lamb*taus])
-    tau, _, _, _ = np.linalg.lstsq(M, b, rcond=None)
 
+    # Get number of channels
+    n_channels = Diff.shape[1]
+
+    # Build first-difference matrix for smoothness regularization
+    if smoothness > 0:
+        # D matrix: penalizes differences between adjacent channels
+        D = np.zeros((n_channels - 1, n_channels))
+        for i in range(n_channels - 1):
+            D[i, i] = -1
+            D[i, i + 1] = 1
+
+        # Regularized inversion: min ||lamb*Diff*tau - lamb*taus||² + ||smoothness*D*tau||²
+        M = np.vstack([lamb * Diff, smoothness * D])
+        b = np.concatenate([lamb * taus, np.zeros(n_channels - 1)])
+    else:
+        # Original inversion without smoothness
+        M = np.vstack([lamb * Diff])
+        b = np.concatenate([lamb * taus])
+
+    tau, _, _, _ = np.linalg.lstsq(M, b, rcond=None)
 
     #moving average to get smooth tau
     tau = moving_avg(tau, avg_win)
@@ -69,7 +112,17 @@ def ultra_mccc(das_arr, pick, corr_len, max_shift, lamb):
 
 
 
-def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=3, shrinked_window_length= 300, medfilt_iterations=[1, 2, 3]):
+def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=3, shrinked_window_length= 300, medfilt_iterations=[1, 2, 3], smoothness=0.0):
+    """
+    Iterative MCCC with optional smoothness regularization.
+
+    Parameters
+    ----------
+    smoothness : float
+        Smoothness regularization parameter for MCCC. Higher values enforce
+        smoother shifts between adjacent channels. Default: 0.0 (no smoothness).
+        Typical values: 1.0-10.0 for enforcing physical constraints.
+    """
     half_win_len = shrinked_window_length//2
     # Initial setup: calculate base_time and perform the initial shift operation
     # base_time = int(das_arr.shape[1] * 5 / 6)
@@ -89,7 +142,7 @@ def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=
     for i in range(1, n_iterations + 1):
         corr_scale = i
         print(f'Starting MCCC iteration {i}')
-        tau = MCCC(current_arr, corr_len//corr_scale, max_shift//corr_scale, lamb)
+        tau = MCCC(current_arr, corr_len//corr_scale, max_shift//corr_scale, lamb, smoothness=smoothness)
         tau_list.append(tau)
         # Apply tau_shift to adjust the array based on the computed tau
         current_arr = tau_shift(current_arr, tau)

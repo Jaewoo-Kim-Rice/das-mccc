@@ -79,6 +79,7 @@ def mccc_pipeline(
     rolling_window=500,
     median_filter_signs=151,
     cc_for_sign = True,
+    smoothness=0.0,
 ):
     """
     Run full MCCC workflow with plots and return final amplitudes and sign arrays.
@@ -110,7 +111,8 @@ def mccc_pipeline(
         corr_len=corr_len_initial,
         max_shift=max_shift_initial,
         n_iterations=n_iter_initial,
-        lamb=lamb_initial
+        lamb=lamb_initial,
+        smoothness=smoothness
     )
     # plot_MCCC_results(arrs, initial_pick = P_result, line_at = half_win_len)
 
@@ -143,7 +145,8 @@ def mccc_pipeline(
         corr_len=corr_len_secondary,
         max_shift=max_shift_secondary,
         lamb=1,
-        n_iterations=n_iter_secondary
+        n_iterations=n_iter_secondary,
+        smoothness=smoothness
     )
     # plot_MCCC_results(filt_arrs, initial_pick = dt,line_at = half_win_len/2)
 
