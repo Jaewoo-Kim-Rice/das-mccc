@@ -143,6 +143,11 @@ def mccc_pipeline(
     outlier_smooth_window=101,
     outlier_threshold=8.0,
     use_global_window=True,
+    use_smoothed_window=False,
+    smoothed_window_kernel=501,
+    smoothed_window_half_width=50,
+    reference_dt=None,
+    pre_mccc_mask_half_width=None,
 ):
     """
     Run full MCCC workflow with plots and return final amplitudes and sign arrays.
@@ -155,6 +160,13 @@ def mccc_pipeline(
         Masked DAS data for initial MCCC.
     P_result : ndarray
         Initial P picks for MCCC.
+    reference_dt : ndarray, optional
+        Expected time difference between adjacent channels from theoretical curve.
+        Shape: (n_channels-1,). If provided, MCCC will constrain the solution to
+        follow this moveout pattern, preventing cycle skipping.
+
+        Calculate from theoretical picks as:
+            reference_dt = np.diff(theoretical_picks[:, 1])
     Other parameters : optional
         Workflow hyperparameters (see code).
 
@@ -175,7 +187,9 @@ def mccc_pipeline(
         max_shift=max_shift_initial,
         n_iterations=n_iter_initial,
         lamb=lamb_initial,
-        smoothness=smoothness
+        smoothness=smoothness,
+        reference_dt=reference_dt,
+        pre_mccc_mask_half_width=pre_mccc_mask_half_width
     )
     # plot_MCCC_results(arrs, initial_pick = P_result, line_at = half_win_len)
 
@@ -191,10 +205,48 @@ def mccc_pipeline(
     # print(np.array(wins).max())
     # print(arrs[-1], wins)
 
-    # Masking strategy: global window vs per-channel windows
+    # Masking strategy: global window vs smoothed window vs per-channel windows
     valid_wins_mask = ~((wins[:, 0] == 0) & (wins[:, 1] == 0))
 
-    if use_global_window and np.any(valid_wins_mask):
+    if use_smoothed_window and np.any(valid_wins_mask):
+        # Use smoothed (median filtered) window for masking
+        # This removes cycle skip artifacts while preserving moveout structure
+        from scipy.ndimage import median_filter
+        from scipy.interpolate import interp1d
+
+        # Calculate window center
+        win_center = wins.mean(axis=1)
+
+        # Replace invalid windows with NaN for interpolation
+        win_center_clean = win_center.copy()
+        win_center_clean[~valid_wins_mask] = np.nan
+
+        # Interpolate NaN values using nearest valid neighbors
+        valid_indices = np.where(valid_wins_mask)[0]
+        valid_values = win_center_clean[valid_wins_mask]
+        if len(valid_indices) > 0:
+            interp_func = interp1d(valid_indices, valid_values, kind='nearest',
+                                   bounds_error=False, fill_value=(valid_values[0], valid_values[-1]))
+            win_center_clean = interp_func(np.arange(len(win_center_clean)))
+
+        # Apply median filter for smoothing
+        win_center_smooth = median_filter(win_center_clean, size=smoothed_window_kernel, mode='nearest')
+
+        # Create smoothed window range
+        smoothed_wins = np.column_stack([
+            (win_center_smooth - smoothed_window_half_width).astype(int),
+            (win_center_smooth + smoothed_window_half_width).astype(int)
+        ])
+        # Clip to valid range
+        smoothed_wins = np.clip(smoothed_wins, 0, arrs[-1].shape[1] - 1)
+
+        print(f"    Smoothed window: kernel={smoothed_window_kernel}, half_width={smoothed_window_half_width}")
+        print(f"    Smoothed wins range: [{smoothed_wins[:,0].min():.0f}-{smoothed_wins[:,0].max():.0f}] to [{smoothed_wins[:,1].min():.0f}-{smoothed_wins[:,1].max():.0f}]")
+
+        filt_arr = mask_noise(arrs[-1], smoothed_wins)
+        masking_wins = smoothed_wins  # For diagnostic
+
+    elif use_global_window and np.any(valid_wins_mask):
         # Use global window range instead of per-channel windows
         # This prevents wins=[0,0] channels from being completely corrupted
         global_win_min = int(np.min(wins[valid_wins_mask, 0]))
@@ -237,8 +289,42 @@ def mccc_pipeline(
         max_shift=effective_max_shift,
         lamb=1,
         n_iterations=n_iter_secondary,
-        smoothness=smoothness
+        smoothness=smoothness,
+        reference_dt=reference_dt
     )
+
+    # === Global Center Alignment ===
+    # Stack all channels and find the peak, then shift everything so peak is at window center
+    aligned_data_raw = filt_arrs[-1]
+    n_channels, n_samples = aligned_data_raw.shape
+
+    # Stack all channels (median along channel axis for robustness)
+    stacked_waveform = np.nanmedian(aligned_data_raw, axis=0)
+
+    # Find the peak (maximum absolute amplitude)
+    # Use envelope for more robust peak detection
+    from scipy.signal import hilbert
+    analytic_signal = hilbert(stacked_waveform)
+    envelope = np.abs(analytic_signal)
+    stack_peak_idx = np.argmax(envelope)
+
+    # Calculate shift needed to center the peak
+    window_center = n_samples // 2
+    global_shift = window_center - stack_peak_idx
+
+    print(f"    Global centering: stack peak at {stack_peak_idx}, window center at {window_center}, shift={global_shift}")
+
+    # Apply global shift to all channels
+    if global_shift != 0:
+        shifted_data = np.zeros_like(aligned_data_raw)
+        if global_shift > 0:
+            # Shift right (pad left with zeros)
+            shifted_data[:, global_shift:] = aligned_data_raw[:, :n_samples-global_shift]
+        else:
+            # Shift left (pad right with zeros)
+            shifted_data[:, :n_samples+global_shift] = aligned_data_raw[:, -global_shift:]
+        filt_arrs[-1] = shifted_data
+        print(f"    Applied global shift of {global_shift} samples to all channels")
 
     # Stage 5: Ricker correlation on aligned data (refine after secondary MCCC)
     # Use higher mmad_thresh (or disable) since global masking changes amplitude distribution
@@ -263,11 +349,96 @@ def mccc_pipeline(
     n_stage2_filtered = np.sum(stage2_invalid_mask)
     print(f"    Stage 5 Ricker: wins=[0,0]={n_zero_wins} (stage2={n_stage2_filtered}), low_snr={n_low_snr}, nan_signs={n_nan_signs}")
 
+    # ── Aligned trace sign (direct sign reading from aligned waveform) ──
+    # Read sign directly from the center of each aligned trace (Stage 4 output)
+    aligned_data = filt_arrs[-1]  # Stage 4 output (after secondary MCCC)
+    n_channels, n_samples = aligned_data.shape
+    center_idx = n_samples // 2  # Center position (aligned arrival time)
+
+    # Read sign at center with small window average for robustness
+    sign_window = 3  # samples to average around center
+    center_start = max(0, center_idx - sign_window)
+    center_end = min(n_samples, center_idx + sign_window + 1)
+    aligned_center_values = aligned_data[:, center_start:center_end].mean(axis=1)
+    aligned_signs = np.sign(aligned_center_values)  # +1, -1, or 0
+
+    # === FILTER TRACKING: Stage 1 - Raw Ricker signs ===
+    filter_stages = {}
+    filter_stages['1_ricker_raw'] = np.nan_to_num(signs2, nan=0).astype(int).copy()
+
+    # Compare Ricker sign vs Aligned trace sign
+    # Only keep channels where both methods agree
+    ricker_signs_clean = np.nan_to_num(signs2, nan=0)
+    sign_match = (ricker_signs_clean == aligned_signs) & (ricker_signs_clean != 0)
+    sign_mismatch = (ricker_signs_clean != aligned_signs) & (ricker_signs_clean != 0) & (aligned_signs != 0)
+    n_match = np.sum(sign_match)
+    n_mismatch = np.sum(sign_mismatch)
+    n_valid_ricker = np.sum(ricker_signs_clean != 0)
+    print(f"    Sign consistency: match={n_match}, mismatch={n_mismatch} ({100*n_mismatch/max(1,n_valid_ricker):.1f}% of valid)")
+
+    # Filter out mismatched signs (set to NaN)
+    signs2[sign_mismatch] = np.nan
+    amp2[sign_mismatch] = np.nan
+    if n_mismatch > 0:
+        print(f"    Sign mismatch filter: {n_mismatch} channels excluded (Ricker != Aligned trace)")
+
+    # === FILTER TRACKING: Stage 2 - After sign consistency filter ===
+    filter_stages['2_sign_consistency'] = np.nan_to_num(signs2, nan=0).astype(int).copy()
+
+    # Filter channels with relatively weak amplitude compared to neighbors
+    # If a channel's amplitude is much lower than the local median, it's likely noise
+    from scipy.ndimage import median_filter as ndimage_medfilt
+    amp2_clean = np.nan_to_num(amp2, nan=0)
+    local_median_amp = ndimage_medfilt(amp2_clean, size=101, mode='nearest')
+    # Channels with amplitude < 20% of local median are considered weak
+    relative_amp_ratio = 0.2
+    # Only consider channels with positive amplitude (not already NaN/0)
+    valid_amp_mask = amp2_clean > 0
+    amp_ratio = np.where(local_median_amp > 0, amp2_clean / local_median_amp, 1.0)
+    weak_amp_mask = (amp_ratio < relative_amp_ratio) & valid_amp_mask
+    n_weak_amp = np.sum(weak_amp_mask)
+    n_valid = np.sum(valid_amp_mask)
+    print(f"    Amplitude ratio stats: min={amp_ratio[valid_amp_mask].min():.3f}, median={np.median(amp_ratio[valid_amp_mask]):.3f}, valid={n_valid}")
+    if n_weak_amp > 0:
+        signs2[weak_amp_mask] = np.nan
+        amp2[weak_amp_mask] = np.nan
+        print(f"    Weak amplitude filter: {n_weak_amp} channels excluded (amp < {relative_amp_ratio:.0%} of local median)")
+
+    # === FILTER TRACKING: Stage 3 - After weak amplitude filter ===
+    filter_stages['3_weak_amp'] = np.nan_to_num(signs2, nan=0).astype(int).copy()
+
+    # Pick smoothness data (for visualization only, filter disabled)
+    win_center2 = wins2.mean(axis=1)  # Ricker window center position
+    valid_pick_mask = (wins2[:, 0] != 0) | (wins2[:, 1] != 0)  # Channels with valid picks
+
+    # Calculate local median of pick positions
+    win_center2_clean = np.where(valid_pick_mask, win_center2, np.nan)
+    local_median_pick = ndimage_medfilt(np.nan_to_num(win_center2_clean, nan=0), size=51, mode='nearest')
+
+    # Calculate deviation from local median
+    pick_deviation = np.abs(win_center2 - local_median_pick)
+
+    # Threshold for visualization (filter is disabled)
+    pick_jump_threshold = 15  # samples
+    pick_jump_mask = (pick_deviation > pick_jump_threshold) & valid_pick_mask & ~np.isnan(signs2)
+    # NOTE: Pick smoothness filter is DISABLED - data kept for visualization only
+
     # Use Stage 5 Ricker results for sign extraction
     signs = np.nan_to_num(signs2, nan=0).astype(int)
     amps = np.nan_to_num(amp2, nan=0)
+
+    # === FILTER TRACKING: Stage 4 - Before medfilt ===
+    filter_stages['4_before_medfilt'] = signs.copy()
+
     signs = medfilt(signs, median_filter_signs)
+
+    # === FILTER TRACKING: Stage 5 - After medfilt ===
+    filter_stages['5_after_medfilt'] = signs.copy()
+
     signs = signs * sign_filter_by_amp(amps)
+
+    # === FILTER TRACKING: Stage 6 - After amp filter ===
+    filter_stages['6_after_amp_filter'] = signs.copy()
 
     # Final P arrival picks
     final_P_arrivals = base_time - (total_shift + filt_total_shift)
@@ -286,6 +457,9 @@ def mccc_pipeline(
             signs[outlier_mask] = 0
             print(f"    Excluded {n_outliers} outlier picks ({100*n_outliers/len(final_P_arrivals):.1f}%)")
 
+    # === FILTER TRACKING: Stage 7 - After outlier filter (final) ===
+    filter_stages['7_final'] = signs.copy()
+
     # ── data for plot ──
     arrivals_plot = np.where(np.abs(signs) == 1, final_P_arrivals, np.nan) - 2
     left_overlay   = (shrinked_window_length // 4) - 50 * signs
@@ -297,6 +471,7 @@ def mccc_pipeline(
 
     # ── diagnostic data for MCCC stages ──
     diagnostic_payload = {
+        "stage0_after_shift": arrs[1],             # After initial shift only (before MCCC)
         "stage1_after_mccc1": arrs[-1],           # After initial MCCC
         "stage2_wins": wins,                       # Ricker correlation windows (per-channel)
         "stage3_after_mask": filt_arr,             # After mask_noise + medfilt
@@ -309,6 +484,14 @@ def mccc_pipeline(
         "signs": signs,                            # Polarity signs
         "base_time": base_time,
         "half_win_len": half_win_len,
+        # Pick smoothness data for visualization
+        "pick_center": win_center2,                # Ricker pick center position
+        "pick_local_median": local_median_pick,    # Local median of pick positions
+        "pick_deviation": pick_deviation,          # Deviation from local median
+        "pick_jump_mask": pick_jump_mask,          # Channels excluded by smoothness filter
+        "pick_jump_threshold": pick_jump_threshold,  # Threshold used
+        # Filter stages for visualization (04c plot)
+        "filter_stages": filter_stages,            # Dict of sign arrays at each filter stage
     }
     
     # fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))  # sharey=True if needed

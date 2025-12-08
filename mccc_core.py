@@ -14,7 +14,7 @@ from .filtering import moving_avg
 from .array_ops import shift_arr, tau_shift
 
 
-def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothness=0.0):
+def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothness=0.0, reference_dt=None):
     """
     Multi-channel cross-correlation with optional smoothness regularization.
 
@@ -37,6 +37,20 @@ def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothne
         shifts between adjacent channels. Typical values: 0.1-10.0
         Based on physical constraint: adjacent channels (5m apart) should not
         differ by more than ~1ms at 5000 m/s max velocity.
+    reference_dt : ndarray, optional
+        Expected time difference between adjacent channels from theoretical curve.
+        Shape: (n_channels-1,). If provided, smoothness regularization targets
+        this curve instead of zero, preventing cycle skipping by constraining
+        the solution to follow the expected moveout pattern.
+
+        When reference_dt is provided:
+          - Regularization becomes: ||smoothness * (D*tau - reference_dt)||²
+          - This allows MCCC to follow the theoretical moveout while still
+            using cross-correlation for fine-tuning
+
+        When reference_dt is None (default):
+          - Regularization is: ||smoothness * D*tau||²
+          - This enforces adjacent channels to have similar shifts (zero difference)
 
     Returns
     -------
@@ -61,9 +75,22 @@ def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothne
             D[i, i] = -1
             D[i, i + 1] = 1
 
-        # Regularized inversion: min ||lamb*Diff*tau - lamb*taus||² + ||smoothness*D*tau||²
+        # Determine target for smoothness constraint
+        if reference_dt is not None:
+            # Use theoretical moveout as target
+            # Ensure reference_dt has correct shape
+            if len(reference_dt) != n_channels - 1:
+                print(f"  Warning: reference_dt length ({len(reference_dt)}) != n_channels-1 ({n_channels-1}), ignoring")
+                b_smooth = np.zeros(n_channels - 1)
+            else:
+                b_smooth = reference_dt
+        else:
+            # Original behavior: target zero difference
+            b_smooth = np.zeros(n_channels - 1)
+
+        # Regularized inversion: min ||lamb*Diff*tau - lamb*taus||² + ||smoothness*(D*tau - b_smooth)||²
         M = np.vstack([lamb * Diff, smoothness * D])
-        b = np.concatenate([lamb * taus, np.zeros(n_channels - 1)])
+        b = np.concatenate([lamb * taus, smoothness * b_smooth])
     else:
         # Original inversion without smoothness
         M = np.vstack([lamb * Diff])
@@ -112,7 +139,7 @@ def ultra_mccc(das_arr, pick, corr_len, max_shift, lamb):
 
 
 
-def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=3, shrinked_window_length= 300, medfilt_iterations=[1, 2, 3], smoothness=0.0):
+def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=3, shrinked_window_length= 300, medfilt_iterations=[1, 2, 3], smoothness=0.0, reference_dt=None, pre_mccc_mask_half_width=None):
     """
     Iterative MCCC with optional smoothness regularization.
 
@@ -122,6 +149,14 @@ def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=
         Smoothness regularization parameter for MCCC. Higher values enforce
         smoother shifts between adjacent channels. Default: 0.0 (no smoothness).
         Typical values: 1.0-10.0 for enforcing physical constraints.
+    reference_dt : ndarray, optional
+        Expected time difference between adjacent channels from theoretical curve.
+        Shape: (n_channels-1,). If provided, MCCC will constrain the solution to
+        follow this moveout pattern, preventing cycle skipping.
+    pre_mccc_mask_half_width : int, optional
+        If provided, apply aggressive masking after initial shift but before MCCC.
+        Only keeps center +/- pre_mccc_mask_half_width samples, zeros out the rest.
+        Example: pre_mccc_mask_half_width=100 keeps only 100 samples on each side of center.
     """
     half_win_len = shrinked_window_length//2
     # Initial setup: calculate base_time and perform the initial shift operation
@@ -133,6 +168,17 @@ def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=
     # Select the region of interest (e.g., 150 samples around base_time)
     shifted_arr = shifted_arr[:, base_time - half_win_len: base_time + half_win_len]
 
+    # Apply aggressive pre-MCCC masking if requested
+    if pre_mccc_mask_half_width is not None:
+        center = shifted_arr.shape[1] // 2
+        mask_start = center - pre_mccc_mask_half_width
+        mask_end = center + pre_mccc_mask_half_width
+        # Zero out everything outside the mask window
+        masked_arr = np.zeros_like(shifted_arr)
+        masked_arr[:, mask_start:mask_end] = shifted_arr[:, mask_start:mask_end]
+        shifted_arr = masked_arr
+        print(f'  Applied pre-MCCC mask: center +/- {pre_mccc_mask_half_width} samples (keeping {mask_start}:{mask_end})')
+
     # Set up the initial array for the iterative process
     current_arr = shifted_arr
     tau_list = []  # List to store tau values from each iteration
@@ -142,7 +188,7 @@ def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=
     for i in range(1, n_iterations + 1):
         corr_scale = i
         print(f'Starting MCCC iteration {i}')
-        tau = MCCC(current_arr, corr_len//corr_scale, max_shift//corr_scale, lamb, smoothness=smoothness)
+        tau = MCCC(current_arr, corr_len//corr_scale, max_shift//corr_scale, lamb, smoothness=smoothness, reference_dt=reference_dt)
         tau_list.append(tau)
         # Apply tau_shift to adjust the array based on the computed tau
         current_arr = tau_shift(current_arr, tau)
