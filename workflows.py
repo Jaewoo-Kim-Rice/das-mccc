@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import medfilt
+from sklearn.linear_model import RANSACRegressor, LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import make_pipeline
 
 from .phasenet import get_picks, runPNDAS
 from .regression import pick_regression_ransac
@@ -146,6 +149,9 @@ def mccc_pipeline(
     use_smoothed_window=False,
     smoothed_window_kernel=501,
     smoothed_window_half_width=50,
+    use_ransac_smoothing=False,
+    ransac_poly_degree=4,
+    ransac_residual_threshold=10,
     reference_dt=None,
     pre_mccc_mask_half_width=None,
 ):
@@ -229,8 +235,37 @@ def mccc_pipeline(
                                    bounds_error=False, fill_value=(valid_values[0], valid_values[-1]))
             win_center_clean = interp_func(np.arange(len(win_center_clean)))
 
-        # Apply median filter for smoothing
-        win_center_smooth = median_filter(win_center_clean, size=smoothed_window_kernel, mode='nearest')
+        # Apply smoothing: RANSAC polynomial or median filter
+        if use_ransac_smoothing:
+            # RANSAC polynomial fitting - robust to outliers (cycle skip steps)
+            X = np.arange(len(win_center_clean)).reshape(-1, 1)
+            y = win_center_clean
+
+            # Create RANSAC regressor with polynomial features
+            # min_samples must be set explicitly when using a pipeline estimator
+            # For polynomial of degree n, we need at least n+1 points
+            ransac = RANSACRegressor(
+                estimator=make_pipeline(
+                    PolynomialFeatures(degree=ransac_poly_degree),
+                    LinearRegression()
+                ),
+                min_samples=ransac_poly_degree + 1,
+                residual_threshold=ransac_residual_threshold,
+                random_state=42,
+                max_trials=1000
+            )
+
+            try:
+                ransac.fit(X, y)
+                win_center_smooth = ransac.predict(X)
+                n_inliers = np.sum(ransac.inlier_mask_)
+                print(f"    RANSAC smoothing: degree={ransac_poly_degree}, threshold={ransac_residual_threshold}, inliers={n_inliers}/{len(y)}")
+            except Exception as e:
+                print(f"    RANSAC failed ({e}), falling back to median filter")
+                win_center_smooth = median_filter(win_center_clean, size=smoothed_window_kernel, mode='nearest')
+        else:
+            # Default: median filter smoothing
+            win_center_smooth = median_filter(win_center_clean, size=smoothed_window_kernel, mode='nearest')
 
         # Create smoothed window range
         smoothed_wins = np.column_stack([
@@ -298,15 +333,11 @@ def mccc_pipeline(
     aligned_data_raw = filt_arrs[-1]
     n_channels, n_samples = aligned_data_raw.shape
 
-    # Stack all channels (median along channel axis for robustness)
-    stacked_waveform = np.nanmedian(aligned_data_raw, axis=0)
-
-    # Find the peak (maximum absolute amplitude)
-    # Use envelope for more robust peak detection
-    from scipy.signal import hilbert
-    analytic_signal = hilbert(stacked_waveform)
-    envelope = np.abs(analytic_signal)
-    stack_peak_idx = np.argmax(envelope)
+    # Stack energy (squared amplitude) to avoid sign cancellation
+    # When channels have opposite polarities, signed stacking cancels out
+    # Energy stacking preserves the peak location regardless of polarity
+    stacked_energy = np.nanmedian(aligned_data_raw**2, axis=0)
+    stack_peak_idx = np.argmax(stacked_energy)
 
     # Calculate shift needed to center the peak
     window_center = n_samples // 2
