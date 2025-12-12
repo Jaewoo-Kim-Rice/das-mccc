@@ -386,11 +386,12 @@ def mccc_pipeline(
     n_channels, n_samples = aligned_data.shape
     center_idx = n_samples // 2  # Center position (aligned arrival time)
 
-    # Read sign at center with small window average for robustness
-    sign_window = 3  # samples to average around center
-    center_start = max(0, center_idx - sign_window)
-    center_end = min(n_samples, center_idx + sign_window + 1)
-    aligned_center_values = aligned_data[:, center_start:center_end].mean(axis=1)
+    # Read sign at center with window average for robustness
+    # Using ±10 samples window to avoid zero-crossing ambiguity
+    sign_window_half = 10  # half-width: ±10 samples = 21 total
+    center_start = max(0, center_idx - sign_window_half)
+    center_end = min(n_samples, center_idx + sign_window_half + 1)
+    aligned_center_values = aligned_data[:, center_start:center_end].sum(axis=1)  # sum for dominant sign
     aligned_signs = np.sign(aligned_center_values)  # +1, -1, or 0
 
     # === FILTER TRACKING: Stage 1 - Raw Ricker signs ===

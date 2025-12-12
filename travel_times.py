@@ -154,9 +154,25 @@ def travel_times_to_samples(
     Returns
     -------
     sample_indices : np.ndarray
-        Sample indices for each travel time
+        Sample indices for each travel time (NaN values are interpolated)
     """
-    sample_indices = origin_sample + (travel_times * sampling_rate).astype(int)
+    # Convert to samples (keeping as float for now)
+    samples_float = origin_sample + (travel_times * sampling_rate)
+
+    # Handle NaN values by interpolation from neighboring valid values
+    nan_mask = np.isnan(samples_float)
+    if nan_mask.any():
+        valid_mask = ~nan_mask
+        if valid_mask.any():
+            # Interpolate NaN values from valid neighbors
+            indices = np.arange(len(samples_float))
+            samples_float[nan_mask] = np.interp(
+                indices[nan_mask],
+                indices[valid_mask],
+                samples_float[valid_mask]
+            )
+
+    sample_indices = samples_float.astype(int)
     return sample_indices
 
 
