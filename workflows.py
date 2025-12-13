@@ -566,7 +566,8 @@ def masking_sp(
     mask_pick_window=10,
     mask_pick_thresh=10,
     ransac_degree=2,
-    ransac_fit_range=(500, None)
+    ransac_fit_range=(500, None),
+    skip_phasenet=False
 ):
     """
     Apply noise-based masking to P picks, run PNDAS, mask and merge picks,
@@ -627,6 +628,10 @@ def masking_sp(
         patch_size=patch_size_secondary,
         method=method
     )
+
+    # Skip PhaseNet when using theoretical picks (not needed)
+    if skip_phasenet:
+        return sp_masked, None, perfect_p_masked
 
     # Run PNDAS to get S picks
     _, S_result = runPNDAS(

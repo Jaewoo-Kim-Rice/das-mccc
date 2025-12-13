@@ -49,8 +49,9 @@ def calculate_travel_times(
     event_depth: float,
     channel_coords: np.ndarray,
     model_path: str,
-    utm_zone: int = 12
-) -> Tuple[np.ndarray, np.ndarray]:
+    utm_zone: int = 12,
+    return_takeoff_angles: bool = False
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Calculate theoretical P and S travel times for all channels.
 
@@ -69,6 +70,8 @@ def calculate_travel_times(
         Path to 1D velocity model file (.nd format for PyRocko cake)
     utm_zone : int
         UTM zone for coordinate conversion (default: 12)
+    return_takeoff_angles : bool
+        If True, also return takeoff angles (default: False)
 
     Returns
     -------
@@ -76,6 +79,8 @@ def calculate_travel_times(
         P-wave travel times in seconds for each channel
     travel_times_s : np.ndarray
         S-wave travel times in seconds for each channel
+    takeoff_angles : np.ndarray (optional)
+        Takeoff angles in degrees for each channel (only if return_takeoff_angles=True)
     """
     if cake is None:
         raise ImportError("PyRocko is required for travel time calculation. "
@@ -90,6 +95,7 @@ def calculate_travel_times(
     n_channels = len(channel_coords)
     travel_times_p = np.zeros(n_channels)
     travel_times_s = np.zeros(n_channels)
+    takeoff_angles = np.zeros(n_channels) if return_takeoff_angles else None
 
     # Calculate travel times for each channel
     for i in range(n_channels):
@@ -117,7 +123,7 @@ def calculate_travel_times(
         else:
             travel_times_p[i] = np.nan
 
-        # S-wave travel time
+        # S-wave travel time and takeoff angle
         phases_s = cake.PhaseDef("s")
         rays_s = model.arrivals(
             phases=[phases_s],
@@ -128,9 +134,21 @@ def calculate_travel_times(
 
         if rays_s:
             travel_times_s[i] = rays_s[0].t
+            if return_takeoff_angles:
+                # Takeoff angle from S-wave (same logic as das_forward.py)
+                if rec_depth > event_depth:
+                    # Receiver is deeper - swap gives incidence angle
+                    takeoff_angles[i] = rays_s[0].incidence_angle()
+                else:
+                    # Normal case
+                    takeoff_angles[i] = rays_s[0].takeoff_angle()
         else:
             travel_times_s[i] = np.nan
+            if return_takeoff_angles:
+                takeoff_angles[i] = np.nan
 
+    if return_takeoff_angles:
+        return travel_times_p, travel_times_s, takeoff_angles
     return travel_times_p, travel_times_s
 
 
@@ -184,8 +202,9 @@ def get_theoretical_picks(
     model_path: str,
     sampling_rate: float = 1000.0,
     origin_sample: int = 1000,
-    utm_zone: int = 12
-) -> Tuple[np.ndarray, np.ndarray]:
+    utm_zone: int = 12,
+    return_takeoff_angles: bool = False
+) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Get theoretical P and S pick times as sample indices.
 
@@ -209,6 +228,8 @@ def get_theoretical_picks(
         Sample index corresponding to origin time (default: 1000, i.e., 1s into the trace)
     utm_zone : int
         UTM zone for coordinate conversion (default: 12)
+    return_takeoff_angles : bool
+        If True, also return takeoff angles for visualization caching (default: False)
 
     Returns
     -------
@@ -216,6 +237,8 @@ def get_theoretical_picks(
         P-wave pick sample indices, shape (n_channels, 2) with [channel_idx, sample_idx]
     S_picks : np.ndarray
         S-wave pick sample indices, shape (n_channels, 2) with [channel_idx, sample_idx]
+    takeoff_angles : np.ndarray (optional)
+        Takeoff angles in degrees (only if return_takeoff_angles=True)
 
     Examples
     --------
@@ -236,11 +259,18 @@ def get_theoretical_picks(
     ...     origin_sample=1000  # Origin at 1s into trace
     ... )
     """
-    # Calculate travel times
-    tt_p, tt_s = calculate_travel_times(
-        event_lat, event_lon, event_depth,
-        channel_coords, model_path, utm_zone
-    )
+    # Calculate travel times (and optionally takeoff angles)
+    if return_takeoff_angles:
+        tt_p, tt_s, takeoff_angles = calculate_travel_times(
+            event_lat, event_lon, event_depth,
+            channel_coords, model_path, utm_zone,
+            return_takeoff_angles=True
+        )
+    else:
+        tt_p, tt_s = calculate_travel_times(
+            event_lat, event_lon, event_depth,
+            channel_coords, model_path, utm_zone
+        )
 
     # Convert to sample indices
     samples_p = travel_times_to_samples(tt_p, sampling_rate, origin_sample)
@@ -251,6 +281,8 @@ def get_theoretical_picks(
     P_picks = np.column_stack([np.arange(n_channels), samples_p])
     S_picks = np.column_stack([np.arange(n_channels), samples_s])
 
+    if return_takeoff_angles:
+        return P_picks, S_picks, takeoff_angles
     return P_picks, S_picks
 
 

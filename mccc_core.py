@@ -8,13 +8,25 @@ and polarity determination in DAS data.
 import numpy as np
 import pandas as pd
 from scipy.signal import medfilt
+from scipy import sparse
+from scipy.sparse.linalg import lsqr
 
-from .signal_utils import ricker, MMAD, rms, normal_distribution, limited_cc
+from .signal_utils import ricker, MMAD, rms, normal_distribution, limited_cc, NUMBA_AVAILABLE
 from .filtering import moving_avg
 from .array_ops import shift_arr, tau_shift
 
+# Import numba if available
+if NUMBA_AVAILABLE:
+    from numba import jit, prange
+else:
+    prange = range
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
-def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothness=0.0, reference_dt=None):
+
+def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothness=0.0, reference_dt=None, use_parallel=True):
     """
     Multi-channel cross-correlation with optional smoothness regularization.
 
@@ -51,6 +63,9 @@ def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothne
         When reference_dt is None (default):
           - Regularization is: ||smoothness * D*tau||²
           - This enforces adjacent channels to have similar shifts (zero difference)
+    use_parallel : bool
+        If True, use Numba-parallelized version of get_diff_corr for faster
+        computation on multi-core systems (default: True).
 
     Returns
     -------
@@ -62,18 +77,22 @@ def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothne
         pad_size = 300
         padding_arr = shifted_arr[-pad_size:]
         shifted_arr = np.concatenate((shifted_arr, padding_arr[::-1]))
-    Diff, taus = get_diff_corr(shifted_arr, corr_len=corr_len, max_shift=max_shift)
+
+    if use_parallel:
+        Diff, taus = get_diff_corr_parallel(shifted_arr, corr_len=corr_len, max_shift=max_shift)
+    else:
+        Diff, taus = get_diff_corr(shifted_arr, corr_len=corr_len, max_shift=max_shift)
 
     # Get number of channels
     n_channels = Diff.shape[1]
 
     # Build first-difference matrix for smoothness regularization
     if smoothness > 0:
-        # D matrix: penalizes differences between adjacent channels
-        D = np.zeros((n_channels - 1, n_channels))
-        for i in range(n_channels - 1):
-            D[i, i] = -1
-            D[i, i + 1] = 1
+        # D matrix: penalizes differences between adjacent channels (sparse)
+        d_data = np.concatenate([-np.ones(n_channels - 1), np.ones(n_channels - 1)])
+        d_row = np.concatenate([np.arange(n_channels - 1), np.arange(n_channels - 1)])
+        d_col = np.concatenate([np.arange(n_channels - 1), np.arange(1, n_channels)])
+        D_sparse = sparse.csr_matrix((d_data, (d_row, d_col)), shape=(n_channels - 1, n_channels))
 
         # Determine target for smoothness constraint
         if reference_dt is not None:
@@ -89,14 +108,16 @@ def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothne
             b_smooth = np.zeros(n_channels - 1)
 
         # Regularized inversion: min ||lamb*Diff*tau - lamb*taus||² + ||smoothness*(D*tau - b_smooth)||²
-        M = np.vstack([lamb * Diff, smoothness * D])
+        Diff_sparse = sparse.csr_matrix(lamb * Diff)
+        M_sparse = sparse.vstack([Diff_sparse, smoothness * D_sparse])
         b = np.concatenate([lamb * taus, smoothness * b_smooth])
     else:
-        # Original inversion without smoothness
-        M = np.vstack([lamb * Diff])
-        b = np.concatenate([lamb * taus])
+        # Original inversion without smoothness (sparse)
+        M_sparse = sparse.csr_matrix(lamb * Diff)
+        b = lamb * taus
 
-    tau, _, _, _ = np.linalg.lstsq(M, b, rcond=None)
+    # Use sparse lsqr solver (much faster than dense lstsq)
+    tau = lsqr(M_sparse, b, atol=1e-10, btol=1e-10)[0]
 
     #moving average to get smooth tau
     tau = moving_avg(tau, avg_win)
@@ -234,6 +255,131 @@ def get_diff_corr(shifted_arr, corr_len, max_shift):
                 indices.append([i,j])
     taus= np.array(taus)
     Diff= np.array(Diff)
+    return Diff, taus
+
+
+# Numba-optimized parallel cross-correlation kernel
+@jit(nopython=True, parallel=True, cache=True)
+def _compute_correlations_parallel(shifted_arr, pairs_i, pairs_j, pairs_max_shift, taus):
+    """
+    Numba-optimized parallel cross-correlation computation.
+
+    Computes cross-correlation for all channel pairs in parallel and finds
+    the shift that maximizes absolute correlation.
+    """
+    n_pairs = len(pairs_i)
+    n_samples = shifted_arr.shape[1]
+
+    for k in prange(n_pairs):
+        i = pairs_i[k]
+        j = pairs_j[k]
+        max_shift_ij = pairs_max_shift[k]
+
+        tr_i = shifted_arr[i, :]
+        tr_j = shifted_arr[j, :]
+
+        # Find shift with maximum absolute correlation (inline limited_cc logic)
+        n_shifts = 2 * max_shift_ij + 1
+        best_shift = 0
+        best_abs_corr = 0.0
+
+        for s in range(n_shifts):
+            shift = s - max_shift_ij
+            corr_val = 0.0
+
+            if shift < 0:
+                for idx in range(n_samples + shift):
+                    corr_val += tr_i[idx] * tr_j[idx - shift]
+            elif shift > 0:
+                for idx in range(n_samples - shift):
+                    corr_val += tr_i[idx + shift] * tr_j[idx]
+            else:
+                for idx in range(n_samples):
+                    corr_val += tr_i[idx] * tr_j[idx]
+
+            if abs(corr_val) > best_abs_corr:
+                best_abs_corr = abs(corr_val)
+                best_shift = shift
+
+        taus[k] = best_shift
+
+
+def get_diff_corr_parallel(shifted_arr, corr_len, max_shift):
+    """
+    Numba-parallelized version of get_diff_corr.
+
+    Uses parallel processing to compute cross-correlations for all channel
+    pairs simultaneously, providing significant speedup on multi-core systems.
+
+    Parameters
+    ----------
+    shifted_arr : ndarray
+        Shifted waveform array of shape (n_channels, n_samples)
+    corr_len : int
+        Correlation window length (number of adjacent channels to correlate)
+    max_shift : int
+        Maximum allowed shift (note: actual max_shift per pair depends on channel distance)
+
+    Returns
+    -------
+    Diff : ndarray
+        Difference matrix of shape (n_pairs, n_channels)
+    taus : ndarray
+        Time shifts for each pair
+    """
+    n_channels = shifted_arr.shape[0]
+
+    # Step 1: Pre-compute all (i, j, max_shift_ij) pairs - vectorized inner loop
+    pairs_i_list = []
+    pairs_j_list = []
+
+    for i in range(n_channels):
+        corr_start = i - corr_len
+        corr_end = min(n_channels - 1, i + corr_len)
+        target_idx = normal_distribution(corr_start, corr_end, 50)
+
+        # Vectorized filtering: valid indices where j > i
+        valid_mask = (target_idx >= 0) & (target_idx < n_channels) & (target_idx > i)
+        valid_j = target_idx[valid_mask]
+
+        if len(valid_j) > 0:
+            pairs_i_list.append(np.full(len(valid_j), i, dtype=np.int64))
+            pairs_j_list.append(valid_j.astype(np.int64))
+
+    # Concatenate all pairs at once
+    if pairs_i_list:
+        pairs_i = np.concatenate(pairs_i_list)
+        pairs_j = np.concatenate(pairs_j_list)
+    else:
+        pairs_i = np.array([], dtype=np.int64)
+        pairs_j = np.array([], dtype=np.int64)
+
+    # Vectorized max_shift calculation
+    pairs_max_shift = np.maximum((pairs_j - pairs_i) * 0.2, 3).astype(np.int64)
+    n_pairs = len(pairs_i)
+
+    # Step 2: Compute cross-correlations in parallel
+    taus = np.zeros(n_pairs, dtype=np.float64)
+
+    # Ensure array is contiguous for Numba
+    shifted_arr_c = np.ascontiguousarray(shifted_arr)
+
+    if NUMBA_AVAILABLE and n_pairs > 0:
+        _compute_correlations_parallel(shifted_arr_c, pairs_i, pairs_j, pairs_max_shift, taus)
+    else:
+        # Fallback to sequential computation
+        for k in range(n_pairs):
+            i, j, ms = pairs_i[k], pairs_j[k], pairs_max_shift[k]
+            corr = limited_cc(shifted_arr[i, :], shifted_arr[j, :], ms)
+            taus[k] = np.argmax(np.abs(corr)) - ms
+
+    # Step 3: Build Diff matrix - vectorized using fancy indexing
+    Diff = np.zeros((n_pairs, n_channels))
+    if n_pairs > 0:
+        row_indices = np.arange(n_pairs)
+        Diff[row_indices, pairs_i] = 1
+        Diff[row_indices, pairs_j] = -1
+
     return Diff, taus
     
 
