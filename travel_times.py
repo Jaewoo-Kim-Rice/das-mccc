@@ -62,10 +62,10 @@ def calculate_travel_times(
     event_lon : float
         Event longitude in degrees
     event_depth : float
-        Event depth in meters (positive downward)
+        Event depth in meters (TVD: True Vertical Depth from local surface)
     channel_coords : np.ndarray
-        Channel coordinates array of shape (n_channels, 3) with (easting, northing, depth)
-        Depth should be positive downward (e.g., 1500m below surface = 1500)
+        Channel coordinates array of shape (n_channels, 3) with (easting, northing, TVD)
+        TVD = True Vertical Depth from local surface (positive downward)
     model_path : str
         Path to 1D velocity model file (.nd format for PyRocko cake)
     utm_zone : int
@@ -81,6 +81,17 @@ def calculate_travel_times(
         S-wave travel times in seconds for each channel
     takeoff_angles : np.ndarray (optional)
         Takeoff angles in degrees for each channel (only if return_takeoff_angles=True)
+
+    Notes
+    -----
+    DEPTH CONVENTION:
+    - The FORGE 1D velocity model (FORGE_1d.nd) is defined with z=0 at the LOCAL SURFACE
+      (approximately 1660m elevation above sea level), NOT at sea level.
+    - Therefore, depths should be passed as TVD (True Vertical Depth from local surface),
+      NOT as TVDSS (True Vertical Depth Sub Sea).
+    - TVD: 0 at surface, positive downward (e.g., 2600m = 2600m below surface)
+    - TVDSS: 0 at sea level, negative above sea level, positive below
+    - For FORGE: TVD ≈ TVDSS + 1660m (approximately)
     """
     if cake is None:
         raise ImportError("PyRocko is required for travel time calculation. "
@@ -97,25 +108,42 @@ def calculate_travel_times(
     travel_times_s = np.zeros(n_channels)
     takeoff_angles = np.zeros(n_channels) if return_takeoff_angles else None
 
+    # Use TVD directly - the FORGE velocity model has z=0 at local surface (~1660m ASL)
+    # No surface_elevation adjustment needed
+    cake_event_depth = event_depth
+
     # Calculate travel times for each channel
     for i in range(n_channels):
         rec_x, rec_y, rec_depth = channel_coords[i]
 
-        # Ensure receiver depth is non-negative (PyRocko requires z >= 0)
-        rec_depth = max(0.0, rec_depth)
+        # Use TVD directly as cake depth
+        cake_rec_depth = rec_depth
 
         # Calculate horizontal distance
         dx = rec_x - event_x
         dy = rec_y - event_y
         distance = np.sqrt(dx**2 + dy**2)
 
+        # Determine zstart/zstop based on which is deeper (same as das_forward.py)
+        # PyRocko cake expects deeper point as zstart for proper ray tracing
+        if cake_rec_depth > cake_event_depth:
+            # Receiver is deeper - swap source/receiver for ray tracing
+            zstart = cake_rec_depth
+            zstop = cake_event_depth
+            swapped = True
+        else:
+            # Normal case - source is deeper
+            zstart = cake_event_depth
+            zstop = cake_rec_depth
+            swapped = False
+
         # P-wave travel time
         phases_p = cake.PhaseDef("p")
         rays_p = model.arrivals(
             phases=[phases_p],
             distances=[distance * cake.m2d],
-            zstart=event_depth,
-            zstop=rec_depth,
+            zstart=zstart,
+            zstop=zstop,
         )
 
         if rays_p:
@@ -128,16 +156,16 @@ def calculate_travel_times(
         rays_s = model.arrivals(
             phases=[phases_s],
             distances=[distance * cake.m2d],
-            zstart=event_depth,
-            zstop=rec_depth,
+            zstart=zstart,
+            zstop=zstop,
         )
 
         if rays_s:
             travel_times_s[i] = rays_s[0].t
             if return_takeoff_angles:
                 # Takeoff angle from S-wave (same logic as das_forward.py)
-                if rec_depth > event_depth:
-                    # Receiver is deeper - swap gives incidence angle
+                if swapped:
+                    # When swapped, incidence_angle gives the angle at original source
                     takeoff_angles[i] = rays_s[0].incidence_angle()
                 else:
                     # Normal case
@@ -217,9 +245,10 @@ def get_theoretical_picks(
     event_lon : float
         Event longitude in degrees
     event_depth : float
-        Event depth in meters (positive downward)
+        Event depth in meters (TVD: True Vertical Depth from local surface)
     channel_coords : np.ndarray
-        Channel coordinates array of shape (n_channels, 3) with (easting, northing, depth)
+        Channel coordinates array of shape (n_channels, 3) with (easting, northing, TVD)
+        TVD = True Vertical Depth from local surface (positive downward)
     model_path : str
         Path to 1D velocity model file
     sampling_rate : float
@@ -240,23 +269,21 @@ def get_theoretical_picks(
     takeoff_angles : np.ndarray (optional)
         Takeoff angles in degrees (only if return_takeoff_angles=True)
 
+    Notes
+    -----
+    DEPTH CONVENTION: Use TVD (True Vertical Depth from local surface), NOT TVDSS.
+    See calculate_travel_times() docstring for detailed explanation.
+
     Examples
     --------
-    >>> # Load event data
-    >>> event = pd.read_csv('event_data.csv').iloc[0]
-    >>>
-    >>> # Get channel coordinates (easting, northing, depth)
-    >>> coords = np.load('channel_coords.npy')
-    >>>
-    >>> # Calculate theoretical picks
+    >>> # Calculate theoretical picks using TVD
     >>> P_picks, S_picks = get_theoretical_picks(
-    ...     event_lat=event['lat'],
-    ...     event_lon=event['lon'],
-    ...     event_depth=event['depth[m_local]'],
-    ...     channel_coords=coords,
+    ...     event_lat=38.503, event_lon=-112.883,
+    ...     event_depth=2610.85,  # TVD in meters
+    ...     channel_coords=coords,  # coords[:,2] should be TVD
     ...     model_path='FORGE_1d.nd',
     ...     sampling_rate=1000.0,
-    ...     origin_sample=1000  # Origin at 1s into trace
+    ...     origin_sample=1000
     ... )
     """
     # Calculate travel times (and optionally takeoff angles)
