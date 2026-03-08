@@ -20,10 +20,11 @@ import torch
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic        = True
-torch.backends.cudnn.benchmark            = False
-torch.backends.cudnn.enabled              = False   # kills all cuDNN kernels
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic        = True
+    torch.backends.cudnn.benchmark            = False
+    torch.backends.cudnn.enabled              = False   # kills all cuDNN kernels
 torch.use_deterministic_algorithms(True)
 
 import seisbench.models as sbm
@@ -32,13 +33,13 @@ from obspy import Trace
 from . import phasenet_utils as utils
 
 # Initialize PhaseNet models
-device_torch = "cuda"
+device_torch = "cuda" if torch.cuda.is_available() else "cpu"
 ml_detector = sbm.PhaseNet(in_channels=1).from_pretrained('original', version_str='latest')
 ml_detector.eval()
-ml_detector.to("cuda")
+ml_detector.to(device_torch)
 ml_detector_3d = sbm.PhaseNet(in_channels=3).from_pretrained('original', version_str='latest')
 ml_detector_3d.eval()
-ml_detector_3d.to("cuda")
+ml_detector_3d.to(device_torch)
 
 
 def runPN(arr, n_component = 1): # 1c arr = (sensor, trace); 3c arr = (sensor, component (N E Z), trace)
