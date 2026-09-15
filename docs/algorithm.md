@@ -55,6 +55,31 @@ What the knobs mean physically:
   neighbours; an amplitude outlier narrower than `medfilt_channels` is not visible to the
   MMAD test.
 
+## Settings in physical units
+
+Every knob is in samples and channels; `DIRECT` and `SECONDARY` were calibrated at 1 kHz on
+fibres with 2 m channel spacing (das-focmec ev_1090, CAPE 2025 reads) and have not been
+validated at other rates or spacings. A caller with a different `fs` (Hz) and channel
+spacing `dx` (m) converts as follows and should log the resulting configuration:
+
+| knob | DIRECT | physical meaning at 1 kHz, 2 m | conversion |
+|---|---|---|---|
+| `window`, `pre_mask` | 200, 100 | 200 ms, 100 ms | ms x fs / 1000 |
+| `corr_len` | 200 ch | 400 m along the fibre | m / dx |
+| `partner_std` | 20 ch | 40 m | m / dx |
+| `pair_slope` | 0.2 sample/ch | 0.1 ms/m residual slope | ms/m x dx x fs / 1000 |
+| `pair_min_shift` | 3 samples | 3 ms | ms x fs / 1000 |
+| `tau_avg` | 100 ch | 200 m | m / dx |
+| `medfilt_channels` | 25 ch | 50 m | m / dx, rounded to odd |
+| `anchor_guard`, `coherence_half` | 40, 30 samples | 40 ms, 30 ms | ms x fs / 1000 |
+| `polarity.half_win`, `max_lag` | 30, 10 samples | 30 ms, 10 ms | ms x fs / 1000 |
+| `polarity.fs`, `ricker_hz` | 1000, 50 | 50 Hz Ricker | set `fs`; keep `ricker_hz` |
+| `smoothness`, `lamb`, `n_iter`, `n_partners` | 50, 1, 4, 50 | dimensionless | unchanged |
+
+`smoothness` weights `(tau[c+1] - tau[c])^2` in samples^2 per channel, so strictly it scales
+with `(fs / 1000)^2 / dx`; at the tested settings it hardly changes the result (see above)
+and is left as is.
+
 ## Anchoring (`anchor.py`)
 
 Network MCCC returns relative delays only, so the refined curve sits where the initial
@@ -96,8 +121,11 @@ itself is never blanked by the QC; apply `kept` as you see fit.
 
 ## Several phases (`refine_phases`)
 
-Phases are refined in `order` (default S, P, SP, REFL), the strongest first. Before a
-phase is refined every already refined phase is hidden: +-`mask_half` (45) samples around
+`curves` maps a key to an initial curve; the key is the phase tag unless `tags` maps each
+key to its tag, which is how several curves of one tag (two reflections, an SP per
+interface) are refined in one call. Curves are refined by the position of their tag in
+`order` (default S, P, SP, REFL), the strongest first, and within a tag in input order.
+Before a curve is refined every already refined curve is hidden: +-`mask_half` (45) samples around
 its `curve_relative` are zeroed, except within `guard_channels` (50) of the junction
 channel where the new phase's initial curve comes within `mask_half` of the parent.
 Blanking the junction would let the child drift there (measured: junction |dt| 0 to
@@ -110,7 +138,7 @@ implemented.
 | name | in | out |
 |---|---|---|
 | `refine_curve(waveform, curve, cfg=DIRECT, mask=None, use_numba=None)` | gather, curve | `RefineResult` |
-| `refine_phases(waveform, curves, order, cfg_by_tag, mask_half, guard_channels)` | gather, `{tag: curve}` | `{tag: RefineResult}` |
+| `refine_phases(waveform, curves, order, cfg_by_tag, mask_half, guard_channels, tags)` | gather, `{key: curve}` (+ `{key: tag}`) | `{key: RefineResult}` |
 | `RefineConfig`, `DIRECT`, `SECONDARY` | | frozen dataclass |
 | `RefineResult` | | `curve, shifts, aligned, stack, coherence, polarity, snr, kept, anchor_offset, taus, qc, channel_range`, property `curve_relative` |
 | `first_lobe(stack, centre, min_frac, guard)`, `stack_peak(stack, centre)` | 1-D stack | offset (samples) |

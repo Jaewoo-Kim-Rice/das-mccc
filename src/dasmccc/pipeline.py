@@ -264,30 +264,42 @@ def refine_phases(
     mask_half: int = 45,
     guard_channels: int = 50,
     use_numba: bool | None = None,
+    tags: dict[str, str] | None = None,
 ) -> dict[str, RefineResult]:
-    """Refine several phases of one gather, strongest first.
+    """Refine several curves of one gather, strongest phase first.
 
-    Phases are processed in ``order`` (tags absent from ``curves`` are skipped; a tag in
-    ``curves`` but not in ``order`` is an error). Before refining a phase, every phase
-    already refined is hidden by zeroing +-mask_half samples around its refined curve at
-    the initial curve's level (``curve_relative``), except within ``guard_channels`` of
-    the junction channel where the new phase's initial curve comes within ``mask_half``
-    samples of that refined curve: blanking the junction would let the child drift there.
+    ``curves`` maps a key to an initial curve. By default the key is the phase tag; when
+    one gather holds several curves of the same tag (two reflections, an SP candidate per
+    interface) pass ``tags`` mapping every key to its tag and use any keys you like.
+    Curves are processed by the position of their tag in ``order`` (tags absent from
+    ``curves`` are skipped; a curve whose tag is not in ``order`` is an error) and, within
+    one tag, in the order of ``curves``. The result is keyed like ``curves`` in processing
+    order.
+
+    Before refining a curve, every curve already refined is hidden by zeroing +-mask_half
+    samples around its refined curve at the initial curve's level (``curve_relative``),
+    except within ``guard_channels`` of the junction channel where the new curve's initial
+    curve comes within ``mask_half`` samples of that refined curve: blanking the junction
+    would let the child drift there.
 
     ``cfg_by_tag`` defaults to DIRECT for "P" and "S" and SECONDARY for every other tag;
     entries given override or extend that.
     """
-    unknown = set(curves) - set(order)
+    tag_of = {k: k for k in curves} if tags is None else dict(tags)
+    missing = set(curves) - set(tag_of)
+    if missing:
+        raise ValueError(f"curves {sorted(missing)} have no entry in tags")
+    unknown = {k: tag_of[k] for k in curves if tag_of[k] not in order}
     if unknown:
-        raise ValueError(f"curves {sorted(unknown)} are not in order {order}")
+        raise ValueError(f"curves {unknown} have tags outside order {order}")
     cfgs = {"P": DIRECT, "S": DIRECT}
     if cfg_by_tag:
         cfgs.update(cfg_by_tag)
+    keys = sorted(curves, key=lambda k: order.index(tag_of[k]))  # stable within a tag
     results: dict[str, RefineResult] = {}
-    for tag in order:
-        if tag not in curves:
-            continue
-        child0 = np.asarray(curves[tag], float)
+    for key in keys:
+        tag = tag_of[key]
+        child0 = np.asarray(curves[key], float)
         mask = np.zeros(waveform.shape, bool)
         for done in results.values():
             parent = done.curve_relative
@@ -303,6 +315,7 @@ def refine_phases(
                 p = int(round(parent[ch]))
                 mask[ch, max(0, p - mask_half) : p + mask_half] = True
         cfg = cfgs.get(tag, SECONDARY)
-        log.info("refine_phases: %s with %s", tag, "DIRECT" if cfg is DIRECT else "config")
-        results[tag] = refine_curve(waveform, child0, cfg, mask=mask, use_numba=use_numba)
+        name = "DIRECT" if cfg is DIRECT else "config"
+        log.info("refine_phases: %s (%s) with %s", key, tag, name)
+        results[key] = refine_curve(waveform, child0, cfg, mask=mask, use_numba=use_numba)
     return results

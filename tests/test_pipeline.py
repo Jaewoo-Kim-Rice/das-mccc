@@ -114,3 +114,22 @@ def test_refine_phases_masks_the_parent_outside_the_junction_guard(gather):
     # S refined as usual; SP sees the gather with S masked except around the junction
     assert shape_mad(out["S"].curve)[0] < 0.6
     assert out["SP"].channel_range == (60, N_CH)
+
+
+def test_refine_phases_several_curves_per_tag_via_tags(gather):
+    s0 = initial_curve()
+    r1 = TRUE + 80.0 - 0.6 * np.arange(N_CH)
+    r1[:60] = np.nan
+    r2 = TRUE + 60.0 + 0.4 * np.arange(N_CH)
+    r2[-50:] = np.nan
+    curves = {"refl_b": r2, "direct": s0, "refl_a": r1}
+    with pytest.raises(ValueError):
+        refine_phases(gather, curves)  # keys are not tags
+    with pytest.raises(ValueError):
+        refine_phases(gather, curves, tags={"direct": "S", "refl_a": "REFL"})  # refl_b missing
+    tags = {"direct": "S", "refl_a": "REFL", "refl_b": "REFL"}
+    out = refine_phases(gather, curves, tags=tags)
+    assert list(out) == ["direct", "refl_b", "refl_a"]  # S first, then REFL in input order
+    assert shape_mad(out["direct"].curve)[0] < 0.6
+    assert out["refl_a"].channel_range == (60, N_CH)
+    assert out["refl_b"].channel_range == (0, N_CH - 50)

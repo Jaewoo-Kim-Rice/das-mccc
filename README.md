@@ -41,13 +41,17 @@ res.aligned, res.stack   # the aligned window and its stack, for plots
 
 # several phases of one gather, strongest first; refined phases are masked for the next
 out = refine_phases(waveform, {"S": s_curve, "P": p_curve, "SP": sp_curve})
+# several curves of one tag: any keys, plus a key -> tag map
+out = refine_phases(waveform, {"S": s_curve, "R1": r1, "R2": r2},
+                    tags={"S": "S", "R1": "REFL", "R2": "REFL"})
 ```
 
 Settings live in `RefineConfig` (everything in samples and channels). `DIRECT` is the
 das-focmec configuration for direct waves (window 200, corr_len 200, smoothness 50, four
 passes, pre-mask 100); `SECONDARY` narrows it for conversions and reflections (window
-120, corr_len 100, three passes, pre-mask 50). See `docs/algorithm.md` for what each knob
-does and for the anchoring and masking rules.
+120, corr_len 100, three passes, pre-mask 50). Both were calibrated at 1 kHz and 2 m channel
+spacing; `docs/algorithm.md` gives the conversion to other rates and spacings, what each
+knob does, and the anchoring and masking rules.
 
 ## What it does not do
 
