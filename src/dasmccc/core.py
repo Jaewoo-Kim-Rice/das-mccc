@@ -1,468 +1,199 @@
-"""
-Multi-channel cross-correlation (MCCC) core algorithms.
+"""Network multi-channel cross-correlation (MCCC) on an aligned DAS gather.
 
-This module provides the core MCCC algorithms for phase alignment
-and polarity determination in DAS data.
+One MCCC pass measures, for every channel, the lag that maximises the absolute
+correlation with about fifty partner channels drawn from a normal distribution
+within +-corr_len channels, then solves the sparse least-squares problem
+
+    min_tau || lamb * (tau_i - tau_j - lag_ij) ||^2 + || smoothness * (tau_{c+1} - tau_c) ||^2
+
+and smooths tau with a moving average. ``iterate_align`` repeats the pass, applying tau
+to the gather and median-filtering it along the fibre between passes.
+
+Sign convention: a positive tau[c] means channel c currently arrives *later* than its
+partners by tau samples (the aligned trace has to be advanced by tau).
+
+Every quantity is in samples or channels; the per-pair lag bound
+``max(pair_slope * |i - j|, pair_min_shift)`` is a bound on the *residual* moveout
+slope relative to the initial curve, not on the absolute moveout.
 """
+
+from __future__ import annotations
 
 import numpy as np
-import pandas as pd
-from scipy.signal import medfilt
 from scipy import sparse
 from scipy.sparse.linalg import lsqr
 
-from .signal_utils import ricker, MMAD, rms, normal_distribution, limited_cc, NUMBA_AVAILABLE
-from .filtering import moving_avg
-from .array_ops import shift_arr, tau_shift
-
-# Import numba if available
-if NUMBA_AVAILABLE:
-    from numba import jit, prange
-else:
-    prange = range
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
+from .ops import moving_avg, spatial_median, tau_shift
+from .signal import NUMBA_AVAILABLE, jit, limited_cc, normal_distribution, prange
 
 
-def MCCC(shifted_arr, corr_len, max_shift, lamb, avg_win=30, pad=False, smoothness=0.0, reference_dt=None, use_parallel=True):
+def partner_pairs(
+    n_channels: int, corr_len: int, n_partners: int = 50, partner_std: float = 20.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Channel pairs (i, j) with j > i to correlate.
+
+    For each channel i, ``n_partners`` candidates are drawn as quantiles of a normal
+    distribution (std ``partner_std`` channels) truncated to
+    [i - corr_len, min(n_channels - 1, i + corr_len)]; candidates outside the fibre or
+    with j <= i are dropped, so each channel keeps roughly n_partners / 2 partners ahead
+    of it (the pairs behind it come from the earlier channels).
     """
-    Multi-channel cross-correlation with optional smoothness regularization.
-
-    Parameters
-    ----------
-    shifted_arr : ndarray
-        Shifted waveform array
-    corr_len : int
-        Correlation window length
-    max_shift : int
-        Maximum allowed shift
-    lamb : float
-        Regularization parameter for cross-correlation
-    avg_win : int
-        Moving average window size
-    pad : bool
-        Whether to pad the array
-    smoothness : float
-        Smoothness regularization parameter. Higher values enforce smoother
-        shifts between adjacent channels. Typical values: 0.1-10.0
-        Based on physical constraint: adjacent channels (5m apart) should not
-        differ by more than ~1ms at 5000 m/s max velocity.
-    reference_dt : ndarray, optional
-        Expected time difference between adjacent channels from theoretical curve.
-        Shape: (n_channels-1,). If provided, smoothness regularization targets
-        this curve instead of zero, preventing cycle skipping by constraining
-        the solution to follow the expected moveout pattern.
-
-        When reference_dt is provided:
-          - Regularization becomes: ||smoothness * (D*tau - reference_dt)||²
-          - This allows MCCC to follow the theoretical moveout while still
-            using cross-correlation for fine-tuning
-
-        When reference_dt is None (default):
-          - Regularization is: ||smoothness * D*tau||²
-          - This enforces adjacent channels to have similar shifts (zero difference)
-    use_parallel : bool
-        If True, use Numba-parallelized version of get_diff_corr for faster
-        computation on multi-core systems (default: True).
-
-    Returns
-    -------
-    tau : ndarray
-        Time shifts for each channel, shape (n_channels, 2)
-    """
-    #Padding
-    if pad:
-        pad_size = 300
-        padding_arr = shifted_arr[-pad_size:]
-        shifted_arr = np.concatenate((shifted_arr, padding_arr[::-1]))
-
-    if use_parallel:
-        Diff, taus = get_diff_corr_parallel(shifted_arr, corr_len=corr_len, max_shift=max_shift)
-    else:
-        Diff, taus = get_diff_corr(shifted_arr, corr_len=corr_len, max_shift=max_shift)
-
-    # Get number of channels
-    n_channels = Diff.shape[1]
-
-    # Build first-difference matrix for smoothness regularization
-    if smoothness > 0:
-        # D matrix: penalizes differences between adjacent channels (sparse)
-        d_data = np.concatenate([-np.ones(n_channels - 1), np.ones(n_channels - 1)])
-        d_row = np.concatenate([np.arange(n_channels - 1), np.arange(n_channels - 1)])
-        d_col = np.concatenate([np.arange(n_channels - 1), np.arange(1, n_channels)])
-        D_sparse = sparse.csr_matrix((d_data, (d_row, d_col)), shape=(n_channels - 1, n_channels))
-
-        # Determine target for smoothness constraint
-        if reference_dt is not None:
-            # Use theoretical moveout as target
-            # Ensure reference_dt has correct shape
-            if len(reference_dt) != n_channels - 1:
-                print(f"  Warning: reference_dt length ({len(reference_dt)}) != n_channels-1 ({n_channels-1}), ignoring")
-                b_smooth = np.zeros(n_channels - 1)
-            else:
-                b_smooth = reference_dt
-        else:
-            # Original behavior: target zero difference
-            b_smooth = np.zeros(n_channels - 1)
-
-        # Regularized inversion: min ||lamb*Diff*tau - lamb*taus||² + ||smoothness*(D*tau - b_smooth)||²
-        Diff_sparse = sparse.csr_matrix(lamb * Diff)
-        M_sparse = sparse.vstack([Diff_sparse, smoothness * D_sparse])
-        b = np.concatenate([lamb * taus, smoothness * b_smooth])
-    else:
-        # Original inversion without smoothness (sparse)
-        M_sparse = sparse.csr_matrix(lamb * Diff)
-        b = lamb * taus
-
-    # Use sparse lsqr solver (much faster than dense lstsq)
-    tau = lsqr(M_sparse, b, atol=1e-10, btol=1e-10)[0]
-
-    #moving average to get smooth tau
-    tau = moving_avg(tau, avg_win)
-    # median filter to get smooth tau
-    if pad:
-        # #removing pad
-        tau = tau[:-pad_size]
-    tau = np.array([range(tau.shape[0]), tau]).T
-    return tau
+    pairs_i, pairs_j = [], []
+    for i in range(n_channels):
+        cand = normal_distribution(
+            i - corr_len, min(n_channels - 1, i + corr_len), n_partners, partner_std
+        )
+        j = cand[(cand >= 0) & (cand < n_channels) & (cand > i)]
+        if j.size:
+            pairs_i.append(np.full(j.size, i, dtype=np.int64))
+            pairs_j.append(j.astype(np.int64))
+    if not pairs_i:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    return np.concatenate(pairs_i), np.concatenate(pairs_j)
 
 
-
-
-def ultra_mccc(das_arr, pick, corr_len, max_shift, lamb):
-    base_time = int(das_arr.shape[1]*5/6)
-    # First MCCC inversion
-    print('starting first MCCC')
-    shifted_arr, fitted_arv, first_shifts = shift_arr(das_arr, pick, base_time = base_time)
-    shifted_arr = shifted_arr[:, base_time-300: base_time+300]
-
-    
-    tau_0 = MCCC(shifted_arr, corr_len, max_shift, lamb)
-    reshifted_arr = tau_shift(shifted_arr, tau_0)
-    
-    # median filter for denoise
-    medfilted_arr = medfilt(reshifted_arr, kernel_size = (25,1))
-
-    # Second MCCC inversion 
-    print('starting second MCCC')
-    tau_1 = MCCC(medfilted_arr, corr_len, max_shift, lamb)
-    final_arr = tau_shift(medfilted_arr, tau_1)
-    #third MCCC inversion 
-    print('starting third MCCC')
-    tau_2 = MCCC(final_arr, corr_len, max_shift, lamb)
-    final_final = tau_shift(final_arr, tau_2)
-    final_final = medfilt(final_final, kernel_size=(25,1))
-
-    total_shift = tau_0[:,1] + tau_1[:,1] + tau_2[:,1] + first_shifts
-    return [das_arr, shifted_arr, reshifted_arr, medfilted_arr, final_arr, final_final], total_shift, [first_shifts, base_time], [tau_0, tau_1, tau_2]
-
-
-
-def ultra_mccc_iterative(das_arr, pick, corr_len, max_shift, lamb, n_iterations=3, shrinked_window_length= 300, medfilt_iterations=[1, 2, 3], smoothness=0.0, reference_dt=None, pre_mccc_mask_half_width=None):
-    """
-    Iterative MCCC with optional smoothness regularization.
-
-    Parameters
-    ----------
-    smoothness : float
-        Smoothness regularization parameter for MCCC. Higher values enforce
-        smoother shifts between adjacent channels. Default: 0.0 (no smoothness).
-        Typical values: 1.0-10.0 for enforcing physical constraints.
-    reference_dt : ndarray, optional
-        Expected time difference between adjacent channels from theoretical curve.
-        Shape: (n_channels-1,). If provided, MCCC will constrain the solution to
-        follow this moveout pattern, preventing cycle skipping.
-    pre_mccc_mask_half_width : int, optional
-        If provided, apply aggressive masking after initial shift but before MCCC.
-        Only keeps center +/- pre_mccc_mask_half_width samples, zeros out the rest.
-        Example: pre_mccc_mask_half_width=100 keeps only 100 samples on each side of center.
-    """
-    half_win_len = shrinked_window_length//2
-    # Initial setup: calculate base_time and perform the initial shift operation
-    # base_time = int(das_arr.shape[1] * 5 / 6)
-    base_time = int(das_arr.shape[1] / 2)
-
-    print('Starting initial shift')
-    shifted_arr, fitted_arv, first_shifts = shift_arr(das_arr, pick, base_time=base_time)
-    # Select the region of interest (e.g., 150 samples around base_time)
-    shifted_arr = shifted_arr[:, base_time - half_win_len: base_time + half_win_len]
-
-    # Apply aggressive pre-MCCC masking if requested
-    if pre_mccc_mask_half_width is not None:
-        center = shifted_arr.shape[1] // 2
-        mask_start = center - pre_mccc_mask_half_width
-        mask_end = center + pre_mccc_mask_half_width
-        # Zero out everything outside the mask window
-        masked_arr = np.zeros_like(shifted_arr)
-        masked_arr[:, mask_start:mask_end] = shifted_arr[:, mask_start:mask_end]
-        shifted_arr = masked_arr
-        print(f'  Applied pre-MCCC mask: center +/- {pre_mccc_mask_half_width} samples (keeping {mask_start}:{mask_end})')
-
-    # Set up the initial array for the iterative process
-    current_arr = shifted_arr
-    tau_list = []  # List to store tau values from each iteration
-    intermediate_results = [das_arr, shifted_arr]  # Store initial results (original array and first shift result)
-
-    # Perform iterative MCCC inversion
-    for i in range(1, n_iterations + 1):
-        corr_scale = i
-        print(f'Starting MCCC iteration {i}')
-        tau = MCCC(current_arr, corr_len//corr_scale, max_shift//corr_scale, lamb, smoothness=smoothness, reference_dt=reference_dt)
-        tau_list.append(tau)
-        # Apply tau_shift to adjust the array based on the computed tau
-        current_arr = tau_shift(current_arr, tau)
-        # Apply median filtering on specified iterations to reduce noise
-        if i in medfilt_iterations:
-            current_arr = medfilt(current_arr, kernel_size=(25, 1))
-        # Save the intermediate result after this iteration
-        intermediate_results.append(current_arr)
-
-    # Calculate the total shift by summing the initial first_shifts with all tau shifts (second column)
-    # Convert first_shifts to float to ensure proper addition with float tau values
-    total_shift = first_shifts.astype(np.float64).copy()
-    for tau in tau_list:
-        total_shift -= tau[:, 1]  # Accumulate the shifts from the second column of each tau
-
-    # Return the list of intermediate results, the total shift, initial information, and the list of tau values
-    return intermediate_results, total_shift, [first_shifts, base_time], tau_list
-
-
-
-def get_diff_corr(shifted_arr, corr_len, max_shift):
-    taus = []
-    Diff= []
-    indices = []
-    Corrs =[]
-    for i in range(shifted_arr.shape[0]):
-        tr = shifted_arr[i, :]
-        corr_start = i-corr_len
-        corr_end = min(shifted_arr.shape[0]-1, i+corr_len)
-        target_idx = normal_distribution(corr_start, corr_end, 50)
-        target_idx = target_idx[(target_idx>=0) & (target_idx<shifted_arr.shape[0])]
-        tau = []
-        for j in target_idx:
-            if i < j:
-                max_shift = int(max((j-i)*0.2, 3)) # max_shift depends on channel diff
-                row = np.zeros(shifted_arr.shape[0])
-                row[i]= 1; row[j] = -1
-                Diff.append(row)
-                corr = limited_cc(tr, shifted_arr[j, :], max_shift)
-                Corrs.append(corr)
-                dt = np.argmax(abs(corr)) - max_shift
-                taus.append(dt)
-                indices.append([i,j])
-    taus= np.array(taus)
-    Diff= np.array(Diff)
-    return Diff, taus
-
-
-# Numba-optimized parallel cross-correlation kernel
 @jit(nopython=True, parallel=True, cache=True)
-def _compute_correlations_parallel(shifted_arr, pairs_i, pairs_j, pairs_max_shift, taus):
-    """
-    Numba-optimized parallel cross-correlation computation.
-
-    Computes cross-correlation for all channel pairs in parallel and finds
-    the shift that maximizes absolute correlation.
-    """
-    n_pairs = len(pairs_i)
-    n_samples = shifted_arr.shape[1]
-
-    for k in prange(n_pairs):
-        i = pairs_i[k]
-        j = pairs_j[k]
-        max_shift_ij = pairs_max_shift[k]
-
-        tr_i = shifted_arr[i, :]
-        tr_j = shifted_arr[j, :]
-
-        # Find shift with maximum absolute correlation (inline limited_cc logic)
-        n_shifts = 2 * max_shift_ij + 1
+def _pair_lags_numba(data, pairs_i, pairs_j, pair_max_shift, lags):  # pragma: no cover - compiled
+    n_samples = data.shape[1]
+    for k in prange(len(pairs_i)):
+        tr_i = data[pairs_i[k], :]
+        tr_j = data[pairs_j[k], :]
+        ms = pair_max_shift[k]
         best_shift = 0
-        best_abs_corr = 0.0
-
-        for s in range(n_shifts):
-            shift = s - max_shift_ij
-            corr_val = 0.0
-
+        best_abs = 0.0
+        for s in range(2 * ms + 1):
+            shift = s - ms
+            total = 0.0
             if shift < 0:
                 for idx in range(n_samples + shift):
-                    corr_val += tr_i[idx] * tr_j[idx - shift]
+                    total += tr_i[idx] * tr_j[idx - shift]
             elif shift > 0:
                 for idx in range(n_samples - shift):
-                    corr_val += tr_i[idx + shift] * tr_j[idx]
+                    total += tr_i[idx + shift] * tr_j[idx]
             else:
                 for idx in range(n_samples):
-                    corr_val += tr_i[idx] * tr_j[idx]
-
-            if abs(corr_val) > best_abs_corr:
-                best_abs_corr = abs(corr_val)
+                    total += tr_i[idx] * tr_j[idx]
+            if abs(total) > best_abs:
+                best_abs = abs(total)
                 best_shift = shift
+        lags[k] = best_shift
 
-        taus[k] = best_shift
 
-
-def get_diff_corr_parallel(shifted_arr, corr_len, max_shift):
+def pairwise_lags(
+    data: np.ndarray,
+    pairs_i: np.ndarray,
+    pairs_j: np.ndarray,
+    pair_slope: float = 0.2,
+    pair_min_shift: int = 3,
+    use_numba: bool | None = None,
+) -> np.ndarray:
+    """Lag (samples) maximising |cross-correlation| of each pair, searched within
+    +-max(pair_slope * (j - i), pair_min_shift) samples. Sign-agnostic, so a polarity
+    flip between channels does not break the alignment.
     """
-    Numba-parallelized version of get_diff_corr.
-
-    Uses parallel processing to compute cross-correlations for all channel
-    pairs simultaneously, providing significant speedup on multi-core systems.
-
-    Parameters
-    ----------
-    shifted_arr : ndarray
-        Shifted waveform array of shape (n_channels, n_samples)
-    corr_len : int
-        Correlation window length (number of adjacent channels to correlate)
-    max_shift : int
-        Maximum allowed shift (note: actual max_shift per pair depends on channel distance)
-
-    Returns
-    -------
-    Diff : ndarray
-        Difference matrix of shape (n_pairs, n_channels)
-    taus : ndarray
-        Time shifts for each pair
-    """
-    n_channels = shifted_arr.shape[0]
-
-    # Step 1: Pre-compute all (i, j, max_shift_ij) pairs - vectorized inner loop
-    pairs_i_list = []
-    pairs_j_list = []
-
-    for i in range(n_channels):
-        corr_start = i - corr_len
-        corr_end = min(n_channels - 1, i + corr_len)
-        target_idx = normal_distribution(corr_start, corr_end, 50)
-
-        # Vectorized filtering: valid indices where j > i
-        valid_mask = (target_idx >= 0) & (target_idx < n_channels) & (target_idx > i)
-        valid_j = target_idx[valid_mask]
-
-        if len(valid_j) > 0:
-            pairs_i_list.append(np.full(len(valid_j), i, dtype=np.int64))
-            pairs_j_list.append(valid_j.astype(np.int64))
-
-    # Concatenate all pairs at once
-    if pairs_i_list:
-        pairs_i = np.concatenate(pairs_i_list)
-        pairs_j = np.concatenate(pairs_j_list)
+    if use_numba is None:
+        use_numba = NUMBA_AVAILABLE
+    if use_numba and not NUMBA_AVAILABLE:
+        raise RuntimeError("use_numba=True requested but numba is not installed")
+    pair_max_shift = np.maximum((pairs_j - pairs_i) * pair_slope, pair_min_shift).astype(np.int64)
+    lags = np.zeros(len(pairs_i), dtype=np.float64)
+    if len(pairs_i) == 0:
+        return lags
+    data_c = np.ascontiguousarray(data, dtype=np.float64)
+    if use_numba:
+        _pair_lags_numba(data_c, pairs_i, pairs_j, pair_max_shift, lags)
     else:
-        pairs_i = np.array([], dtype=np.int64)
-        pairs_j = np.array([], dtype=np.int64)
+        for k in range(len(pairs_i)):
+            ms = int(pair_max_shift[k])
+            corr = limited_cc(data_c[pairs_i[k]], data_c[pairs_j[k]], ms, use_numba=False)
+            lags[k] = np.argmax(np.abs(corr)) - ms
+    return lags
 
-    # Vectorized max_shift calculation
-    pairs_max_shift = np.maximum((pairs_j - pairs_i) * 0.2, 3).astype(np.int64)
+
+def solve_tau(
+    n_channels: int,
+    pairs_i: np.ndarray,
+    pairs_j: np.ndarray,
+    lags: np.ndarray,
+    lamb: float = 1.0,
+    smoothness: float = 0.0,
+    reference_dt: np.ndarray | None = None,
+    tau_avg: int = 100,
+) -> np.ndarray:
+    """Least-squares tau (n_channels,) from pairwise lags, with an optional first-difference
+    smoothness term and a final moving average of ``tau_avg`` channels.
+
+    ``reference_dt`` (n_channels - 1,) makes the smoothness term target that adjacent-channel
+    difference instead of zero (follow a theoretical moveout while correlating).
+    """
     n_pairs = len(pairs_i)
-
-    # Step 2: Compute cross-correlations in parallel
-    taus = np.zeros(n_pairs, dtype=np.float64)
-
-    # Ensure array is contiguous for Numba
-    shifted_arr_c = np.ascontiguousarray(shifted_arr)
-
-    if NUMBA_AVAILABLE and n_pairs > 0:
-        _compute_correlations_parallel(shifted_arr_c, pairs_i, pairs_j, pairs_max_shift, taus)
-    else:
-        # Fallback to sequential computation
-        for k in range(n_pairs):
-            i, j, ms = pairs_i[k], pairs_j[k], pairs_max_shift[k]
-            corr = limited_cc(shifted_arr[i, :], shifted_arr[j, :], ms)
-            taus[k] = np.argmax(np.abs(corr)) - ms
-
-    # Step 3: Build Diff matrix - vectorized using fancy indexing
-    Diff = np.zeros((n_pairs, n_channels))
-    if n_pairs > 0:
-        row_indices = np.arange(n_pairs)
-        Diff[row_indices, pairs_i] = 1
-        Diff[row_indices, pairs_j] = -1
-
-    return Diff, taus
-    
-
-
-def get_sign(arr, snr_thresh = 3, cc=True):
-    ric = ricker(50, 60, 1000)[1]
-    center = arr.shape[1]//2
-    snrs=[]
-    signs = []
-    amps = []
-    for i in range(arr.shape[0]):
-        tr = arr[i, :]
-        signal_win = [center-30, center+30]
-        amp = rms(tr[signal_win[0]:signal_win[1]])
-        mask = np.ones(len(tr), dtype=bool)
-        mask[signal_win[0]:signal_win[1]] = False
-        noise = rms(tr[mask])
-        snr = amp/noise
-        # sign = np.sign(tr[center])
-        if cc:
-            corr = limited_cc(ric, tr[signal_win[0]:signal_win[1]], 10)
-            corr_argmax = np.argmax(abs(corr))
-            sign = np.sign(corr[corr_argmax])
+    rows = np.repeat(np.arange(n_pairs), 2)
+    cols = np.column_stack([pairs_i, pairs_j]).ravel()
+    vals = np.tile([1.0, -1.0], n_pairs)
+    diff = sparse.csr_matrix((lamb * vals, (rows, cols)), shape=(n_pairs, n_channels))
+    b = lamb * np.asarray(lags, float)
+    if smoothness > 0:
+        m = n_channels - 1
+        d_rows = np.repeat(np.arange(m), 2)
+        d_cols = np.column_stack([np.arange(m), np.arange(1, n_channels)]).ravel()
+        d_vals = np.tile([-1.0, 1.0], m)
+        d_mat = sparse.csr_matrix((smoothness * d_vals, (d_rows, d_cols)), shape=(m, n_channels))
+        if reference_dt is None:
+            b_smooth = np.zeros(m)
         else:
-            sign = np.sign(tr[center])
-        # sign = np.sign(np.correlate(ric, tr[signal_win[0]:signal_win[1]]))[0]
-        if snr < snr_thresh:
-            sign = 0
-            
-        snrs.append(snr)
-        signs.append(sign)
-        amps.append(amp)
-    return np.array(snrs), np.array(signs), np.array(amps)
-        
+            reference_dt = np.asarray(reference_dt, float)
+            if reference_dt.shape != (m,):
+                raise ValueError(f"reference_dt must have shape ({m},), got {reference_dt.shape}")
+            b_smooth = reference_dt
+        diff = sparse.vstack([diff, d_mat]).tocsr()
+        b = np.concatenate([b, smoothness * b_smooth])
+    tau = lsqr(diff, b, atol=1e-10, btol=1e-10)[0]
+    return moving_avg(tau, tau_avg)
 
 
-def diff_corr_ric(shifted_arr, max_shift, snr_thresh = 5, mmad_thresh = 4.0, ricker_freq = 50):
-    
-    ric = ricker(ricker_freq, shifted_arr.shape[1], 1000)[1]
-    dts, polarities, amps, snrs = [],[],[],[]
-    wins = []
-    for i in range(shifted_arr.shape[0]):
-        tr = shifted_arr[i, :]
-        corr = limited_cc(ric, tr, max_shift)
-        corr_argmax = np.argmax(abs(corr))
-        argmax_win = [min(len(tr)//2, corr_argmax),max(-len(tr)//2, corr_argmax)]
-        # print('before_', argmax_win[0], argmax_win[1])
-        argmax_win = [max_shift + len(tr)//2 - i for i in argmax_win]
-        argmax_win[0] -= 25
-        argmax_win[1] += 25
-        # print('winlength', argmax_win[0], argmax_win[1], argmax_win[1]-argmax_win[0])
-        wins.append(argmax_win)
-        dt = np.argmax(abs(corr)) - max_shift # if negative, it's arriving late
-        polarity = np.sign(corr[corr_argmax])
-        center_idx = shifted_arr.shape[1]//2 - dt
-        amp = rms(tr[argmax_win[0]:argmax_win[1]])
-        # print(argmax_win)
-        mask = np.ones(len(tr), dtype=bool)
-        mask[argmax_win[0]:argmax_win[1]] = False
-        noise = rms(tr[mask])
-        snr = amp/noise
-        if snr <snr_thresh:
-            polarity = np.nan
-            amp = np.nan
-            dt = np.nan
-        snrs.append(snr)
-        dts.append(dt)
-        polarities.append(polarity)
-        amps.append(amp)
-    polarities = np.array(polarities)
-    # filtering near-field affected channels
-    amps = np.array(amps)
-    mmad = MMAD(amps)
-    wins = np.array(wins)
-    #filtering nearfield signals by mmad values
-    wins[mmad>mmad_thresh] = np.array([0,0])
-    amps[mmad> mmad_thresh] = np.nan
-    polarities[mmad> mmad_thresh] = np.nan
-
-    
-    dts = len(tr)//2 - np.array(dts)
-    # amps[np.where(amp_zscore>3)[0]] = 0
-    
-    return dts, polarities, amps, snrs, wins
+def mccc(
+    data: np.ndarray,
+    corr_len: int,
+    n_partners: int = 50,
+    partner_std: float = 20.0,
+    pair_slope: float = 0.2,
+    pair_min_shift: int = 3,
+    lamb: float = 1.0,
+    smoothness: float = 0.0,
+    reference_dt: np.ndarray | None = None,
+    tau_avg: int = 100,
+    use_numba: bool | None = None,
+) -> np.ndarray:
+    """One MCCC pass on an aligned gather (n_channels, n_samples); returns tau (n_channels,)."""
+    pairs_i, pairs_j = partner_pairs(data.shape[0], corr_len, n_partners, partner_std)
+    lags = pairwise_lags(data, pairs_i, pairs_j, pair_slope, pair_min_shift, use_numba)
+    return solve_tau(data.shape[0], pairs_i, pairs_j, lags, lamb, smoothness, reference_dt, tau_avg)
 
 
+def iterate_align(
+    aligned: np.ndarray,
+    corr_len: int,
+    n_iter: int = 4,
+    medfilt_channels: int = 25,
+    medfilt_iters: tuple[int, ...] = (1, 2, 3),
+    use_numba: bool | None = None,
+    **mccc_kwargs,
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+    """Iterated MCCC on a pre-aligned, windowed gather.
+
+    Pass i (1-based) correlates within ``corr_len // i`` channels, applies tau, and median
+    filters the gather along the fibre when i is in ``medfilt_iters``. Returns
+    (aligned, total_tau, taus); ``total_tau`` (n_channels,) is the summed tau, so the
+    refined arrival of channel c is ``round(initial_pick[c]) + total_tau[c]`` in the
+    original sample axis (see ``pipeline.refine_curve``).
+    """
+    taus = []
+    total = np.zeros(aligned.shape[0])
+    for i in range(1, n_iter + 1):
+        tau = mccc(aligned, corr_len // i, use_numba=use_numba, **mccc_kwargs)
+        taus.append(tau)
+        total += tau
+        aligned = tau_shift(aligned, tau)
+        if i in medfilt_iters:
+            aligned = spatial_median(aligned, medfilt_channels)
+    return aligned, total, taus
