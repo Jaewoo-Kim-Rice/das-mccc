@@ -42,14 +42,42 @@ class RefineConfig:
     medfilt_iters   : spatial median filter of the aligned gather after the listed passes.
     pre_mask        : keep only +-pre_mask samples around the alignment sample before the
                       first pass (None = off).
-    stack_polarity  : False (default) stacks the aligned traces as they are, which is what
-                      the human-referenced anchor result was measured with. True multiplies
+    stack           : "norm" (default; every aligned trace divided by its rms before the
+                      mean, so strong channels do not own the stack), "mean" (plain mean) or
+                      "median" (channel-wise median).
+    stack_polarity  : False (default) stacks the aligned traces as they are. True multiplies
                       each trace by its Ricker polarity first (channels with polarity 0
                       left out) so a genuine reversal along the fibre does not cancel the
                       stack; on the CAPE 2025 reads this made the anchor worse (see docs).
-    anchor          : "first_lobe", "stack_peak" or None (keep the initial curve's level).
+    anchor          : "first_lobe", "stack_peak", "parent" or None (keep the initial curve's
+                      level). "parent" is only meaningful inside refine_phases: the curve
+                      takes the anchor offset of the already refined curve it leaves (the one
+                      it comes closest to, within mask_half), so the junction is preserved;
+                      with no such parent the level is kept and a warning is logged.
     anchor_min_frac,
-    anchor_guard    : first_lobe parameters (see anchor.first_lobe).
+    anchor_guard,
+    anchor_contiguous,
+    anchor_window   : first_lobe parameters (see anchor.first_lobe).
+    exclude_near    : refine_phases only. Channels where this curve's initial curve comes
+                      within exclude_near samples of a curve refined before it are not
+                      refined at all: another arrival inside the correlation window
+                      corrupts the alignment and the stack (a P within 170 ms of the S:
+                      the window is +-100 and the S wavelet's leading lobes reach well
+                      beyond the S curve). The remaining runs of at least ``min_run`` channels
+                      are refined separately, each with its own anchor, and the excluded
+                      channels are bridged so the result stays continuous (see ``bridge``
+                      and RefineResult.runs). None = off, which is what SECONDARY uses: a
+                      converted or reflected phase meets its parent at the junction by
+                      construction (see the junction guard).
+    bridge          : how excluded channels are filled. "shift" (default): the initial
+                      curve's shape carried at the refined level, the shift (refined minus
+                      initial at the run ends) interpolated linearly across a gap and held
+                      before the first / after the last run. "initial": the initial curve
+                      as drawn, joined to the runs by tapering the run-end shift to zero
+                      over 50 channels. On the CAPE 2025 P reads "shift" scored better
+                      against the human picks (the initial picker's level convention
+                      differs from the refined one); "initial" is right where the picker
+                      happened to sit on the onset lobe.
     coherence_half  : half window (samples) for the trace-vs-stack coherence.
     polarity        : Ricker polarity / SNR / MMAD settings.
     """
@@ -67,10 +95,16 @@ class RefineConfig:
     medfilt_channels: int = 25
     medfilt_iters: tuple[int, ...] = (1, 2, 3)
     pre_mask: int | None = 100
+    stack: str = "norm"
     stack_polarity: bool = False
     anchor: str | None = "first_lobe"
-    anchor_min_frac: float = 0.3
+    anchor_min_frac: float = 0.4
     anchor_guard: int | None = 40
+    anchor_contiguous: bool = True
+    anchor_window: tuple[int, int] | None = (-30, 10)
+    exclude_near: int | None = 170
+    min_run: int = 60
+    bridge: str = "shift"
     coherence_half: int = 30
     polarity: PolarityConfig = field(default_factory=PolarityConfig)
 
@@ -78,8 +112,12 @@ class RefineConfig:
 DIRECT = RefineConfig()
 """Direct P / S waves (the das-focmec ev_1090 settings)."""
 
-SECONDARY = RefineConfig(window=120, corr_len=100, n_iter=3, pre_mask=50)
-"""Secondary phases (SP conversions, reflections): narrower window, shorter neighbourhood."""
+SECONDARY = RefineConfig(
+    window=120, corr_len=100, n_iter=3, pre_mask=50, anchor="parent", exclude_near=None
+)
+"""Secondary phases (SP conversions, reflections): narrower window, shorter neighbourhood, and
+the level inherited from the parent curve (their own stacks are too weak for a first-lobe rule;
+an independent anchor pulled the junction apart by 15 ms on the CAPE 2025 reads)."""
 
 
 @dataclass
@@ -97,7 +135,16 @@ class RefineResult:
     polarity, snr : from the Ricker step (0 / NaN where undetermined).
     kept          : input finite and not an amplitude outlier and snr >= threshold.
     anchor_offset : samples added to the relative level (0 when anchor is None, NaN when
-                    the anchor rule refused).
+                    the anchor rule refused or no parent was found).
+    parent        : key of the refined curve whose anchor this one inherited (refine_phases
+                    with anchor "parent"), else None.
+    runs          : refine_phases with exclude_near: the [first, last] channel runs that were
+                    refined (separately). Channels of the initial curve outside them are
+                    bridged (RefineConfig.bridge) so the curve is continuous; ``refined``
+                    marks the channels the MCCC actually refined (coherence, snr, polarity
+                    are NaN / 0 elsewhere). None otherwise.
+    anchor_offsets: the anchor offset of each run (``anchor_offset`` is the longest run's).
+    refined       : (n_channels,) bool, see ``runs``; None when nothing was excluded.
     taus          : tau of each pass on the refined channel range.
     """
 
@@ -113,12 +160,35 @@ class RefineResult:
     taus: list[np.ndarray]
     qc: PolarityResult
     channel_range: tuple[int, int]
+    parent: str | None = None
+    runs: list[tuple[int, int]] | None = None
+    anchor_offsets: list[float] | None = None
+    refined: np.ndarray | None = None
 
     @property
     def curve_relative(self) -> np.ndarray:
         """Refined curve at the initial curve's level (no anchor)."""
         off = 0.0 if not np.isfinite(self.anchor_offset) else self.anchor_offset
         return self.curve - off
+
+
+def _stack(aligned: np.ndarray, cfg: RefineConfig, polarity: np.ndarray) -> np.ndarray:
+    tr = aligned
+    if cfg.stack_polarity:
+        signed = polarity != 0
+        if signed.any():
+            tr = aligned[signed] * polarity[signed, None]
+        else:
+            log.warning("no channel has a determined polarity; stacking without polarity")
+    if cfg.stack == "mean":
+        return tr.mean(axis=0)
+    if cfg.stack == "median":
+        return np.median(tr, axis=0)
+    if cfg.stack == "norm":
+        rms = np.sqrt((tr**2).mean(axis=1, keepdims=True))
+        rms[rms == 0] = 1.0
+        return (tr / rms).mean(axis=0)
+    raise ValueError(f"unknown stack kind {cfg.stack!r}")
 
 
 def _coherence(aligned: np.ndarray, stack: np.ndarray, centre: int, half: int) -> np.ndarray:
@@ -207,17 +277,18 @@ def refine_curve(
     relative = np.round(c) + total_tau
 
     qc_sub = ricker_polarity(aligned, cfg.polarity)
-    signed = qc_sub.polarity != 0
-    if cfg.stack_polarity and signed.any():
-        stack = (aligned[signed] * qc_sub.polarity[signed, None]).mean(axis=0)
-    else:
-        if cfg.stack_polarity:
-            log.warning("no channel has a determined polarity; using the plain stack")
-        stack = aligned.mean(axis=0)
-    if cfg.anchor is None:
-        offset = 0.0
+    stack = _stack(aligned, cfg, qc_sub.polarity)
+    if cfg.anchor is None or cfg.anchor == "parent":
+        offset = 0.0  # "parent" is resolved by refine_phases
     elif cfg.anchor == "first_lobe":
-        offset = first_lobe(stack, half, cfg.anchor_min_frac, cfg.anchor_guard)
+        offset = first_lobe(
+            stack,
+            half,
+            cfg.anchor_min_frac,
+            cfg.anchor_guard,
+            cfg.anchor_contiguous,
+            cfg.anchor_window,
+        )
     elif cfg.anchor == "stack_peak":
         offset = stack_peak(stack, half)
     else:
@@ -265,6 +336,7 @@ def refine_phases(
     guard_channels: int = 50,
     use_numba: bool | None = None,
     tags: dict[str, str] | None = None,
+    on_excluded: str = "raise",
 ) -> dict[str, RefineResult]:
     """Refine several curves of one gather, strongest phase first.
 
@@ -284,7 +356,14 @@ def refine_phases(
 
     ``cfg_by_tag`` defaults to DIRECT for "P" and "S" and SECONDARY for every other tag;
     entries given override or extend that.
+
+    A curve whose config sets ``exclude_near`` is not refined where its initial curve runs
+    within that many samples of a curve refined before it (see RefineConfig). When nothing
+    of it survives, ``on_excluded`` decides: "raise" (default) raises ValueError, "skip"
+    logs a warning and leaves the key out of the result.
     """
+    if on_excluded not in ("raise", "skip"):
+        raise ValueError(f"on_excluded must be 'raise' or 'skip', got {on_excluded!r}")
     tag_of = {k: k for k in curves} if tags is None else dict(tags)
     missing = set(curves) - set(tag_of)
     if missing:
@@ -317,5 +396,153 @@ def refine_phases(
         cfg = cfgs.get(tag, SECONDARY)
         name = "DIRECT" if cfg is DIRECT else "config"
         log.info("refine_phases: %s (%s) with %s", key, tag, name)
-        results[key] = refine_curve(waveform, child0, cfg, mask=mask, use_numba=use_numba)
+        if cfg.exclude_near is not None and results:
+            try:
+                res = _refine_runs(waveform, child0, cfg, mask, results, use_numba)
+            except NothingToRefine as e:
+                if on_excluded == "raise":
+                    raise ValueError(f"{key} ({tag}): {e}") from e
+                log.warning("%s (%s) skipped: %s", key, tag, e)
+                continue
+        else:
+            res = refine_curve(waveform, child0, cfg, mask=mask, use_numba=use_numba)
+        if cfg.anchor == "parent":
+            parent_key = _closest_parent(child0, results, mask_half)
+            if parent_key is None:
+                log.warning(
+                    "%s (%s): no refined parent within %d samples; level kept", key, tag, mask_half
+                )
+                res.anchor_offset = float("nan")
+            else:
+                off = results[parent_key].anchor_offset
+                off = 0.0 if not np.isfinite(off) else off
+                res.curve = res.curve + off
+                res.shifts = res.shifts + off
+                res.anchor_offset = float(off)
+                res.parent = parent_key
+        results[key] = res
     return results
+
+
+class NothingToRefine(ValueError):
+    """Every channel of a curve lies within ``exclude_near`` of an already refined curve."""
+
+
+def _refine_runs(
+    waveform: np.ndarray,
+    child0: np.ndarray,
+    cfg: RefineConfig,
+    mask: np.ndarray,
+    done: dict[str, RefineResult],
+    use_numba: bool | None,
+) -> RefineResult:
+    """Refine the runs of ``child0`` that stay at least ``cfg.exclude_near`` samples away from
+    every curve in ``done``; each run of at least ``cfg.min_run`` channels is refined on its
+    own and the per-channel results are assembled (NaN elsewhere)."""
+    keep = np.isfinite(child0)
+    for r in done.values():
+        parent = r.curve_relative
+        both = keep & np.isfinite(parent)
+        keep &= ~(both & (np.abs(np.nan_to_num(child0 - parent, nan=np.inf)) < cfg.exclude_near))
+    idx = np.flatnonzero(keep)
+    runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1) if idx.size else []
+    runs = [run for run in runs if len(run) >= cfg.min_run]
+    n_ex = int(np.isfinite(child0).sum() - sum(len(r) for r in runs))
+    if not runs:
+        raise NothingToRefine(
+            f"no run of {cfg.min_run} channels stays {cfg.exclude_near} samples away from the "
+            "curves refined before this one"
+        )
+    if n_ex:
+        log.info(
+            "exclude_near %d: %d channels not refined, %d runs", cfg.exclude_near, n_ex, len(runs)
+        )
+    parts = []
+    for run in runs:
+        c = np.full(child0.shape, np.nan)
+        c[run] = child0[run]
+        parts.append((run, refine_curve(waveform, c, cfg, mask=mask, use_numba=use_numba)))
+    longest = max(parts, key=lambda p: len(p[0]))[1]
+    out = RefineResult(
+        curve=np.full(child0.shape, np.nan),
+        shifts=np.full(child0.shape, np.nan),
+        aligned=longest.aligned,
+        stack=longest.stack,
+        coherence=np.full(child0.shape, np.nan),
+        polarity=np.zeros(child0.shape),
+        snr=np.full(child0.shape, np.nan),
+        kept=np.zeros(child0.shape, bool),
+        anchor_offset=longest.anchor_offset,
+        taus=longest.taus,
+        qc=longest.qc,
+        channel_range=(int(runs[0][0]), int(runs[-1][-1]) + 1),
+        runs=[(int(r[0]), int(r[-1])) for r in runs],
+        anchor_offsets=[p[1].anchor_offset for p in parts],
+    )
+    for run, r in parts:
+        for name in ("curve", "shifts", "coherence", "polarity", "snr", "kept"):
+            getattr(out, name)[run] = getattr(r, name)[run]
+    refined = np.isfinite(out.curve)
+    _bridge(out, child0, [p[0] for p in parts], cfg.bridge)
+    out.refined = refined
+    return out
+
+
+def _bridge(
+    out: RefineResult,
+    child0: np.ndarray,
+    runs: list[np.ndarray],
+    mode: str = "shift",
+    edge: int = 10,
+    taper: int = 50,
+) -> None:
+    """Fill the channels of ``child0`` that were not refined (see RefineConfig.bridge)."""
+    if mode not in ("shift", "initial"):
+        raise ValueError(f"bridge must be 'shift' or 'initial', got {mode!r}")
+    shift = out.curve - child0
+    n = len(child0)
+    ends = [
+        (
+            int(r[0]),
+            int(r[-1]),
+            float(np.nanmedian(shift[r[:edge]])),
+            float(np.nanmedian(shift[r[-edge:]])),
+        )
+        for r in runs
+    ]
+    fill_shift = np.zeros(n)
+    if mode == "shift":
+        for k, (a, b, s_in, s_out) in enumerate(ends):
+            if k == 0:
+                fill_shift[:a] = s_in
+            if k == len(ends) - 1:
+                fill_shift[b + 1 :] = s_out
+            else:
+                a2, s2 = ends[k + 1][0], ends[k + 1][2]
+                gap = np.arange(b + 1, a2)
+                fill_shift[gap] = s_out + (s2 - s_out) * (gap - b) / (a2 - b)
+    else:
+        for a, b, s_in, s_out in ends:
+            before = np.arange(max(0, a - taper), a)
+            fill_shift[before] += s_in * (1 - (a - before) / taper)
+            after = np.arange(b + 1, min(n, b + 1 + taper))
+            fill_shift[after] += s_out * (1 - (after - b) / taper)
+    fill = np.isfinite(child0) & ~np.isfinite(out.curve)
+    out.curve[fill] = child0[fill] + fill_shift[fill]
+    out.shifts[fill] = fill_shift[fill]
+
+
+def _closest_parent(
+    child0: np.ndarray, done: dict[str, RefineResult], mask_half: int
+) -> str | None:
+    """Key of the refined curve the child's initial curve comes closest to (within mask_half)."""
+    best = None
+    for key, r in done.items():
+        parent = r.curve_relative
+        both = np.isfinite(child0) & np.isfinite(parent)
+        if not both.any():
+            continue
+        d = float(np.min(np.abs(child0[both] - parent[both])))
+        if d <= mask_half and (best is None or d < best[0]):
+            best = (d, key)
+    return None if best is None else best[1]

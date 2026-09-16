@@ -89,11 +89,55 @@ def test_input_validation(gather):
 def test_first_lobe_rule_and_guard():
     t = np.arange(200)
     stack = np.exp(-((t - 120) ** 2) / 20.0) - 0.5 * np.exp(-((t - 100) ** 2) / 20.0)
-    assert first_lobe(stack, 100) == 0.0  # lobe at 100 is 50 % of the peak at 120
-    assert first_lobe(stack, 100, min_frac=0.6) == 20.0  # too small: peak itself
+    legacy = dict(contiguous=False, window=None)
+    assert first_lobe(stack, 100, 0.3, 40, **legacy) == 0.0  # lobe at 100 is 50 % of the peak
+    assert first_lobe(stack, 100, 0.6, 40, **legacy) == 20.0  # too small: peak itself
     assert stack_peak(stack, 100) == 20.0
-    assert first_lobe(stack, 80) == 20.0
-    assert np.isnan(first_lobe(stack, 80, guard=10))  # |20| > 10 -> refused
+    assert first_lobe(stack, 80, 0.3, 40, **legacy) == 20.0
+    assert np.isnan(first_lobe(stack, 80, 0.3, 10, **legacy))  # |20| > 10 -> refused
+    # default window (-30, 10): from centre 100 the peak at 120 is outside, the lobe at 100 is
+    # the in-window peak; from centre 115 the peak is inside and the 50 % lobe qualifies
+    assert first_lobe(stack, 100) == 0.0
+    assert first_lobe(stack, 115) == -15.0
+    assert first_lobe(stack, 115, min_frac=0.6) == 5.0
+    # contiguity: a 50 % lobe at 60 behind a 20 % lobe at 80 is not the onset
+    stack2 = stack - 0.5 * np.exp(-((t - 60) ** 2) / 20.0) + 0.2 * np.exp(-((t - 80) ** 2) / 20.0)
+    assert first_lobe(stack2, 115, window=(-60, 10), guard=None) == -15.0
+    assert first_lobe(stack2, 115, window=(-60, 10), guard=None, contiguous=False) == -55.0
+    with pytest.raises(ValueError):
+        first_lobe(stack, 199, window=(0, 1))
+
+
+def test_stack_kinds_and_short_curves(gather):
+    from dasmccc.pipeline import _stack
+
+    curve = initial_curve()
+    for kind in ("mean", "median", "norm"):
+        res = refine_curve(gather, curve, RefineConfig(stack=kind))
+        assert abs(shape_mad(res.curve)[1] + RICKER_TROUGH) < 1.5
+    with pytest.raises(ValueError):
+        _stack(np.ones((3, 5)), RefineConfig(stack="bogus"), np.ones(3))
+    # 71 channels < tau_avg 100: averaged over all channels instead of failing
+    short = curve.copy()
+    short[71:] = np.nan
+    res = refine_curve(gather, short, DIRECT)
+    assert res.channel_range == (0, 71) and np.isfinite(res.curve[:71]).all()
+
+
+def test_refine_phases_parent_anchor_preserves_the_junction(gather):
+    s0 = initial_curve()
+    sp0 = TRUE + 10.0 + 0.6 * (150 - np.arange(N_CH))  # leaves S at channel 150, earlier above
+    sp0[150:] = np.nan
+    out = refine_phases(gather, {"S": s0, "SP": sp0})
+    assert out["SP"].parent == "S"
+    assert out["SP"].anchor_offset == out["S"].anchor_offset != 0.0
+    d_rel = out["SP"].curve_relative[149] - out["S"].curve_relative[149]
+    d_abs = out["SP"].curve[149] - out["S"].curve[149]
+    assert abs(d_abs - d_rel) < 1e-9
+    # no parent within mask_half: level kept, offset NaN, warning
+    far = sp0 - 200.0
+    alone = refine_phases(gather, {"S": s0, "SP": far})
+    assert np.isnan(alone["SP"].anchor_offset) and alone["SP"].parent is None
 
 
 def test_numpy_fallback_path_gives_the_same_curve(gather):
@@ -133,3 +177,39 @@ def test_refine_phases_several_curves_per_tag_via_tags(gather):
     assert shape_mad(out["direct"].curve)[0] < 0.6
     assert out["refl_a"].channel_range == (60, N_CH)
     assert out["refl_b"].channel_range == (0, N_CH - 50)
+
+
+def test_refine_phases_excludes_channels_too_close_to_a_refined_curve(gather):
+    s0 = initial_curve()
+    # a "P" 60 samples before S over channels 100-199, 250 samples before elsewhere: the middle
+    # is inside exclude_near (170) and must not be refined; the two outer runs are
+    p0 = TRUE - 250.0
+    p0[100:200] = TRUE[100:200] - 60.0
+    out = refine_phases(gather, {"S": s0, "P": p0})
+    p = out["P"]
+    assert p.runs == [(0, 99), (200, N_CH - 1)]
+    assert not p.refined[100:200].any() and p.refined[:100].all() and p.refined[200:].all()
+    assert np.isnan(p.coherence[100:200]).all() and (p.polarity[100:200] == 0).all()
+    assert np.isfinite(p.curve).all()  # bridged: continuous
+    # the bridge keeps the initial shape and joins the runs: shift interpolated across the gap
+    sh = p.curve - p0
+    assert (
+        abs(sh[100] - np.median(sh[90:100])) < 1.5 and abs(sh[199] - np.median(sh[200:210])) < 1.5
+    )
+    # default bridge "shift": the gap carries the interpolated run-end shift
+    assert abs(sh[150] - 0.5 * (np.median(sh[90:100]) + np.median(sh[200:210]))) < 1.5
+    out2 = refine_phases(
+        gather, {"S": s0, "P": p0}, cfg_by_tag={"P": RefineConfig(bridge="initial")}
+    )
+    assert abs((out2["P"].curve - p0)[150]) < 1e-9  # mid-gap, beyond the tapers: the curve as drawn
+    with pytest.raises(ValueError):
+        refine_phases(gather, {"S": s0, "P": p0}, cfg_by_tag={"P": RefineConfig(bridge="bogus")})
+    assert len(p.anchor_offsets) == 2 and p.anchor_offset in p.anchor_offsets
+    # secondaries are never excluded (they meet their parent by construction)
+    sp0 = TRUE + 10.0 + 0.6 * (150 - np.arange(N_CH))
+    sp0[150:] = np.nan
+    assert refine_phases(gather, {"S": s0, "SP": sp0})["SP"].runs is None
+    with pytest.raises(ValueError):
+        refine_phases(gather, {"S": s0, "P": TRUE - 30.0})  # everything too close
+    out = refine_phases(gather, {"S": s0, "P": TRUE - 30.0}, on_excluded="skip")
+    assert list(out) == ["S"]

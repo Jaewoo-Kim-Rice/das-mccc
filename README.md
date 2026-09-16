@@ -39,7 +39,8 @@ res.polarity       # -1 / 0 / +1 per channel
 res.snr, res.coherence, res.kept
 res.aligned, res.stack   # the aligned window and its stack, for plots
 
-# several phases of one gather, strongest first; refined phases are masked for the next
+# several phases of one gather, strongest first; refined phases are masked for the next, and
+# a direct curve is not refined where it runs within 170 samples of one (res.runs, res.refined)
 out = refine_phases(waveform, {"S": s_curve, "P": p_curve, "SP": sp_curve})
 # several curves of one tag: any keys, plus a key -> tag map
 out = refine_phases(waveform, {"S": s_curve, "R1": r1, "R2": r2},
@@ -57,9 +58,10 @@ knob does, and the anchoring and masking rules.
 
 * It does not re-pick. The initial curve decides which arrival and roughly which lobe is
   refined; MCCC measures relative delays within `pair_slope` samples per channel of it.
-* The anchor moves the whole curve by one offset measured on the stack. The first-lobe rule
-  sits about 4 ms before the human onset for P and on it for S on the CAPE 2025 fibres;
-  calibrate that constant per site against a few human picks.
+* The anchor moves the whole curve by one offset measured on the stack (secondary phases
+  inherit their parent's). The first-lobe rule sits about 5 ms before the human pick for P
+  and within a few ms of it for S on the CAPE 2025 fibres, with a per-fibre constant;
+  calibrate it per site against a few human picks when onsets are needed.
 * Sub-sample precision: the alignment is integer; tau is a float but the returned curve
   inherits the integer initial alignment plus the smoothed tau.
 

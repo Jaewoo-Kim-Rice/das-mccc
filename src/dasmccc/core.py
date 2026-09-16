@@ -19,12 +19,16 @@ slope relative to the initial curve, not on the absolute moveout.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import lsqr
 
 from .ops import moving_avg, spatial_median, tau_shift
 from .signal import NUMBA_AVAILABLE, jit, limited_cc, normal_distribution, prange
+
+log = logging.getLogger("dasmccc")
 
 
 def partner_pairs(
@@ -148,6 +152,13 @@ def solve_tau(
         diff = sparse.vstack([diff, d_mat]).tocsr()
         b = np.concatenate([b, smoothness * b_smooth])
     tau = lsqr(diff, b, atol=1e-10, btol=1e-10)[0]
+    if tau_avg > n_channels:
+        log.warning(
+            "tau_avg %d longer than the %d refined channels; averaging over all of them",
+            tau_avg,
+            n_channels,
+        )
+        tau_avg = n_channels
     return moving_avg(tau, tau_avg)
 
 
