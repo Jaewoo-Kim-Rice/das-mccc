@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "das-mccc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Iterative network MCCC refinement of DAS arrival curves with absolute anchoring and Ricker polarity QC"
 readme = "README.md"
 requires-python = ">=3.10"
