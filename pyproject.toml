@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = ["numpy", "scipy"]
 
+[project.urls]
+Repository = "https://github.com/Jaewoo-Kim-Rice/das-mccc"
+
 [project.optional-dependencies]
 numba = ["numba"]
 dev = ["pytest", "ruff"]
