@@ -121,8 +121,10 @@ class RefineConfig:
                 f"samples must be below window / 2 = {self.window // 2}; at this sampling the "
                 f"window ({self.window} samples) is too short for these lags"
             )
-        if self.pre_mask is not None and self.pre_mask >= self.window:
-            raise ValueError(f"pre_mask {self.pre_mask} must be below window {self.window}")
+        if self.pre_mask is not None and self.pre_mask > self.window // 2:
+            raise ValueError(
+                f"pre_mask {self.pre_mask} must not exceed window // 2 = {self.window // 2}"
+            )
 
 
 DIRECT = RefineConfig()
