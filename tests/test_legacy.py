@@ -49,3 +49,15 @@ def test_ricker_windows_shapes_and_rules(gather):
     assert abs(np.nanmedian(r.dt) - 90) < 3
     dts, pol, amp, snr, wins = diff_corr_ric(res.aligned, 37, snr_thresh=1.5, mmad_thresh=3.5)
     assert np.array_equal(wins, r.window) and np.array_equal(dts, r.dt, equal_nan=True)
+
+
+def test_ricker_windows_keeps_the_legacy_nan_snr_rule():
+    # an all-zero block wider than the spatial median kernel reaches the QC untouched:
+    # 0 / 0 gives a NaN snr, which the legacy rule does not reject (amp 0.0, sign kept)
+    rng = np.random.default_rng(0)
+    aligned = rng.standard_normal((60, 200))
+    aligned[20:50] = 0.0
+    r = ricker_windows(aligned, max_lag=37, snr_thresh=1.5, mmad_thresh=3.5)
+    assert np.isnan(r.snr[20:50]).all()
+    assert (r.amplitude[20:50] == 0.0).all()
+    assert np.isfinite(r.polarity[20:50]).all()

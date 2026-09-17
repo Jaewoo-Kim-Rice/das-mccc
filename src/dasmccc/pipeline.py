@@ -108,6 +108,22 @@ class RefineConfig:
     coherence_half: int = 30
     polarity: PolarityConfig = field(default_factory=PolarityConfig)
 
+    def __post_init__(self):
+        """Refuse settings that cannot run: the per-pair lag bound must fit inside the
+        correlation window, else the overlap of two traces is empty and the correlation fails
+        deep inside numpy with an unrelated message."""
+        if self.window < 4:
+            raise ValueError(f"window {self.window} samples is too short (need at least 4)")
+        max_lag = max(self.pair_slope * self.corr_len, self.pair_min_shift)
+        if max_lag >= self.window // 2:
+            raise ValueError(
+                f"the per-pair lag bound max(pair_slope * corr_len, pair_min_shift) = {max_lag:g} "
+                f"samples must be below window / 2 = {self.window // 2}; at this sampling the "
+                f"window ({self.window} samples) is too short for these lags"
+            )
+        if self.pre_mask is not None and self.pre_mask >= self.window:
+            raise ValueError(f"pre_mask {self.pre_mask} must be below window {self.window}")
+
 
 DIRECT = RefineConfig()
 """Direct P / S waves (the das-focmec ev_1090 settings)."""

@@ -213,3 +213,17 @@ def test_refine_phases_excludes_channels_too_close_to_a_refined_curve(gather):
         refine_phases(gather, {"S": s0, "P": TRUE - 30.0})  # everything too close
     out = refine_phases(gather, {"S": s0, "P": TRUE - 30.0}, on_excluded="skip")
     assert list(out) == ["S"]
+
+
+def test_config_refuses_lags_outside_the_window():
+    import pytest
+
+    from dasmccc import RefineConfig
+
+    with pytest.raises(ValueError, match="below window / 2"):
+        RefineConfig(window=10, pair_min_shift=6, pair_slope=0.01, corr_len=10)
+    with pytest.raises(ValueError, match="too short"):
+        RefineConfig(window=2)
+    with pytest.raises(ValueError, match="pre_mask"):
+        RefineConfig(window=100, pre_mask=100, pair_slope=0.1, corr_len=100)
+    RefineConfig(window=200)  # the defaults are consistent

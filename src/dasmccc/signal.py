@@ -54,8 +54,9 @@ def ricker(center_freq: float, n_samples: int, sample_rate: float) -> tuple[np.n
     return t, (1.0 - 2.0 * a) * np.exp(-a)
 
 
-def rms(x: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(np.square(x))))
+def rms(x: np.ndarray) -> np.floating:
+    """Root mean square as a numpy scalar (so that x / 0 gives inf or nan, not an exception)."""
+    return np.sqrt(np.mean(np.square(np.asarray(x, dtype=np.float64))))
 
 
 _TRUNCNORM_TEMPLATES: dict[tuple[float, float, int], np.ndarray] = {}

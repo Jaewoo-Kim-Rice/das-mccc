@@ -137,7 +137,9 @@ def ricker_windows(
             a = rms(tr[w0:w1])
             s = a / rms(tr[rest])
         snr[c] = s
-        if s >= snr_thresh:
+        # legacy rule: reject only when snr < thresh; a NaN snr (all-zero window, 0 / 0)
+        # or an infinite one keeps its amplitude (possibly 0.0) and sign
+        if not s < snr_thresh:
             dts[c] = k - max_lag
             pol[c] = np.sign(corr[k])
             amp[c] = a

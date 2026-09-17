@@ -1,0 +1,258 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "das-mccc Curve Refinement",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "external": {
+          "label": "Caller arrays"
+        },
+        "backend": {
+          "label": "Computation step"
+        },
+        "security": {
+          "label": "Level rule"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "caller",
+      "label": "Arrays in, arrays out"
+    },
+    {
+      "id": "prep",
+      "label": "Alignment (refine_curve)"
+    },
+    {
+      "id": "mccc",
+      "label": "Iterated MCCC (iterate_align)"
+    },
+    {
+      "id": "qc",
+      "label": "Level and quality"
+    }
+  ],
+  "phases": [
+    {
+      "id": "ph_align",
+      "label": "Align on the initial curve",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "ph_mccc",
+      "label": "Measure relative delays",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "ph_level",
+      "label": "Set the level",
+      "fromCol": 4,
+      "toCol": 4
+    }
+  ],
+  "groups": [
+    {
+      "id": "pass_loop",
+      "label": "One MCCC pass, repeated n_iter times",
+      "lane": "mccc",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    }
+  ],
+  "mainPath": [
+    "input",
+    "align",
+    "lags",
+    "solve",
+    "polarity",
+    "anchor",
+    "result"
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "input",
+      "partners"
+    ],
+    "allowedTerminals": [
+      "result"
+    ],
+    "requiredPaths": [
+      {
+        "from": "input",
+        "to": "result"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "input",
+      "lane": "caller",
+      "col": 0,
+      "type": "external",
+      "label": "Gather + initial curve",
+      "sublabel": "(n_ch, n_samples)",
+      "tag": "NaN where unpicked",
+      "width": 150
+    },
+    {
+      "id": "align",
+      "lane": "prep",
+      "col": 1,
+      "type": "backend",
+      "label": "Align and window",
+      "sublabel": "shift_arr, cut +-window/2",
+      "tag": "pre_mask",
+      "width": 140
+    },
+    {
+      "id": "partners",
+      "lane": "mccc",
+      "col": 1,
+      "type": "backend",
+      "label": "partner_pairs",
+      "sublabel": "n_partners on partner_std",
+      "width": 140
+    },
+    {
+      "id": "lags",
+      "lane": "mccc",
+      "col": 2,
+      "type": "backend",
+      "label": "pairwise_lags",
+      "sublabel": "numba or numpy",
+      "tag": "|lag| <= pair_slope * gap",
+      "width": 140
+    },
+    {
+      "id": "solve",
+      "lane": "mccc",
+      "col": 3,
+      "type": "backend",
+      "label": "solve_tau",
+      "sublabel": "lamb, smoothness, tau_avg",
+      "tag": "spatial_median 1, 2, 3",
+      "width": 140
+    },
+    {
+      "id": "polarity",
+      "lane": "qc",
+      "col": 3,
+      "type": "backend",
+      "label": "ricker_polarity",
+      "sublabel": "-1 / 0 / +1 per channel",
+      "tag": "SNR + MMAD outliers",
+      "width": 140
+    },
+    {
+      "id": "anchor",
+      "lane": "qc",
+      "col": 4,
+      "type": "security",
+      "label": "Stack and anchor",
+      "sublabel": "first_lobe, stack_peak, parent",
+      "tag": "refused -> NaN",
+      "width": 178
+    },
+    {
+      "id": "result",
+      "lane": "caller",
+      "col": 4,
+      "type": "backend",
+      "label": "RefineResult",
+      "sublabel": "curve, polarity, snr, kept",
+      "width": 150
+    }
+  ],
+  "edges": [
+    {
+      "id": "e_in_align",
+      "from": "input",
+      "to": "align",
+      "variant": "default"
+    },
+    {
+      "id": "e_align_lags",
+      "from": "align",
+      "to": "lags",
+      "label": "windowed gather",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e_partners_lags",
+      "from": "partners",
+      "to": "lags",
+      "label": "channel pairs",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e_lags_solve",
+      "from": "lags",
+      "to": "solve",
+      "label": "pair lags",
+      "variant": "default"
+    },
+    {
+      "id": "e_solve_lags",
+      "from": "solve",
+      "to": "lags",
+      "label": "next pass, corr_len // i",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "e_solve_polarity",
+      "from": "solve",
+      "to": "polarity",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "e_polarity_anchor",
+      "from": "polarity",
+      "to": "anchor",
+      "label": "stack the aligned traces",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e_anchor_result",
+      "from": "anchor",
+      "to": "result",
+      "label": "one offset",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "What MCCC measures",
+      "items": [
+        "Relative delays only, within pair_slope samples per channel of the initial curve",
+        "The initial curve decides which arrival and roughly which lobe is refined",
+        "Polarity and the stack both read the final aligned gather"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Level and quality",
+      "items": [
+        "The stack is the rms-normalized mean by default; mean and median are the alternatives",
+        "One anchor offset moves the whole curve; a refused rule returns NaN, never a silent zero",
+        "polarity, snr, coherence and kept are returned per channel beside the refined curve"
+      ]
+    }
+  ]
+}
