@@ -79,3 +79,70 @@ def ricker_polarity(aligned: np.ndarray, cfg: PolarityConfig | None = None) -> P
     pol[weak | outlier] = 0
     lag[weak | outlier] = np.nan
     return PolarityResult(pol, snr, amp, lag, outlier)
+
+
+@dataclass
+class RickerWindows:
+    """Per-channel Ricker match on an aligned gather (the das-focmec ``diff_corr_ric`` step).
+
+    dt        : matched arrival sample per channel (n_samples // 2 - lag); NaN below SNR.
+    polarity  : sign of the correlation at its absolute maximum; NaN below SNR or outlier.
+    amplitude : rms of the trace inside the matched window; NaN below SNR or outlier.
+    snr       : rms inside / rms outside the matched window.
+    window    : (n_channels, 2) sample window around the match; [0, 0] for outliers.
+    """
+
+    dt: np.ndarray
+    polarity: np.ndarray
+    amplitude: np.ndarray
+    snr: np.ndarray
+    window: np.ndarray
+
+
+def ricker_windows(
+    aligned: np.ndarray,
+    max_lag: int,
+    snr_thresh: float = 5.0,
+    mmad_thresh: float = 4.0,
+    ricker_hz: float = 50.0,
+    fs: float = 1000.0,
+    half_win: int = 25,
+) -> RickerWindows:
+    """Match a full-length Ricker template to every aligned trace within +-max_lag samples
+    and derive a per-channel window (+-half_win around the match), SNR and polarity; channels
+    whose window rms is an MMAD outlier (near-field, bad channel) get window [0, 0] and NaN
+    polarity / amplitude.
+
+    Ported verbatim from das-focmec ``diff_corr_ric`` (including its window clipping rule)
+    so that the focal-mechanism pipeline reproduces bit for bit.
+    """
+    n_ch, n = aligned.shape
+    template = ricker(ricker_hz, n, fs)[1]
+    half = n // 2
+    dts = np.full(n_ch, np.nan)
+    pol = np.full(n_ch, np.nan)
+    amp = np.full(n_ch, np.nan)
+    snr = np.full(n_ch, np.nan)
+    wins = np.zeros((n_ch, 2), dtype=int)
+    for c in range(n_ch):
+        tr = aligned[c]
+        corr = limited_cc(template, tr, max_lag)
+        k = int(np.argmax(np.abs(corr)))
+        w0 = max_lag + half - min(half, k) - half_win
+        w1 = max_lag + half - max(-half, k) + half_win
+        wins[c] = (w0, w1)
+        rest = np.ones(n, bool)
+        rest[w0:w1] = False
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a = rms(tr[w0:w1])
+            s = a / rms(tr[rest])
+        snr[c] = s
+        if s >= snr_thresh:
+            dts[c] = k - max_lag
+            pol[c] = np.sign(corr[k])
+            amp[c] = a
+    outlier = mmad(amp) > mmad_thresh
+    wins[outlier] = 0
+    amp[outlier] = np.nan
+    pol[outlier] = np.nan
+    return RickerWindows(half - dts, pol, amp, snr, wins)

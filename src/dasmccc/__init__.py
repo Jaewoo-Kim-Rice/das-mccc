@@ -17,7 +17,7 @@ from .pipeline import (
     refine_curve,
     refine_phases,
 )
-from .polarity import PolarityConfig, PolarityResult, ricker_polarity
+from .polarity import PolarityConfig, PolarityResult, RickerWindows, ricker_polarity, ricker_windows
 from .signal import NUMBA_AVAILABLE
 
 __all__ = [
@@ -30,6 +30,7 @@ __all__ = [
     "PolarityResult",
     "RefineConfig",
     "RefineResult",
+    "RickerWindows",
     "first_lobe",
     "iterate_align",
     "mccc",
@@ -38,6 +39,7 @@ __all__ = [
     "refine_curve",
     "refine_phases",
     "ricker_polarity",
+    "ricker_windows",
     "solve_tau",
     "stack_peak",
 ]

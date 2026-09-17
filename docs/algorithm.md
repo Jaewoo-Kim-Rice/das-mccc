@@ -214,6 +214,16 @@ run survives, `refine_phases` raises (`on_excluded="raise"`, default) or logs a 
 and leaves the curve out of the result (`on_excluded="skip"`). Secondary phases (`SECONDARY`, `exclude_near` None) are
 never excluded: they meet their parent at the junction by construction.
 
+## das-focmec compatibility (`dasmccc.legacy`)
+
+`legacy.ultra_mccc_iterative` and `legacy.diff_corr_ric` keep the signatures and return
+values of the das-focmec originals (intermediate arrays, (n, 2) pick and tau layouts,
+`(dts, polarities, amps, snrs, wins)` tuple) on top of the building blocks above, bit for
+bit. `legacy.diff_corr_ric` is the tuple form of `polarity.ricker_windows`, the full-length
+Ricker match that yields the per-channel masking windows of the focal-mechanism pipeline.
+The `max_shift` argument is accepted and ignored, as it always was; pass `None` to avoid
+the deprecation warning.
+
 ## API
 
 | name | in | out |

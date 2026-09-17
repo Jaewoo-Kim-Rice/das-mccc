@@ -54,6 +54,12 @@ passes, pre-mask 100); `SECONDARY` narrows it for conversions and reflections (w
 spacing; `docs/algorithm.md` gives the conversion to other rates and spacings, what each
 knob does, and the anchoring and masking rules.
 
+## For das-focmec
+
+`dasmccc.legacy` exposes `ultra_mccc_iterative` and `diff_corr_ric` with the das-focmec
+signatures and identical results, so `das_focmec.processing.workflows` only changes its
+import line.
+
 ## What it does not do
 
 * It does not re-pick. The initial curve decides which arrival and roughly which lobe is
