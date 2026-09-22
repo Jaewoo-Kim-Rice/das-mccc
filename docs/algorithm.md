@@ -10,9 +10,10 @@ Input: a gather `waveform (n_channels, n_samples)` and an initial arrival `curve
                alignment only (their output stays NaN)
 [2] align      each channel shifted by round(base - curve[c]) so its pick sits at the
                centre; window of +-window/2 cut around it; optional pre_mask keeps only
-               +-pre_mask samples (100 of the 200-sample window by default: nothing
-               beyond 100 ms of the initial curve is ever correlated), with a cosine
-               edge of pre_mask_taper samples (0 by default: a hard cut)
+               +-pre_mask samples (DIRECT: 40 of the 200-sample window, so nothing
+               beyond 40 ms of the initial curve is ever correlated; SECONDARY: 50 of
+               120), with a cosine edge of pre_mask_taper samples (DIRECT 10,
+               SECONDARY 0 = a hard cut)
 [3] passes     for i = 1 .. n_iter:
       (a) partners : for each channel, n_partners (50) candidates drawn as quantiles of a
                      normal distribution (std partner_std = 20 channels) truncated to
@@ -65,7 +66,7 @@ spacing `dx` (m) converts as follows and should log the resulting configuration:
 
 | knob | DIRECT | physical meaning at 1 kHz, 2 m | conversion |
 |---|---|---|---|
-| `window`, `pre_mask` | 200, 100 | 200 ms, 100 ms | ms x fs / 1000 |
+| `window` | 200 | 200 ms | ms x fs / 1000 |
 | `corr_len` | 200 ch | 400 m along the fibre | m / dx |
 | `partner_std` | 20 ch | 40 m | m / dx |
 | `pair_slope` | 0.2 sample/ch | 0.1 ms/m residual slope | ms/m x dx x fs / 1000 |
@@ -209,21 +210,8 @@ channel where the new phase's initial curve comes within `mask_half` of the pare
 Blanking the junction would let the child drift there (measured: junction |dt| 0 to
 11 ms without the guard). Direct phases (P, S) use `DIRECT`, others `SECONDARY` unless
 `cfg_by_tag` says otherwise. Re-imposing the junction as a constraint on the child is not
-implemented.
-
-**Exclusion of interfering channels (`exclude_near`).** A direct curve (`DIRECT`,
-`exclude_near` 100 = the correlation half window) is not refined where its initial curve
-comes within that many samples of a curve refined before it: with the S inside the P window
-the pairwise correlations lock on the S and the stack is S energy, and no mask width fixes
-it (tested 45 to 75 samples, relative or anchored centre). The remaining runs of at least
-`min_run` (60) channels are refined separately, each with its own anchor; the assembled
-result has NaN on the excluded channels, `RefineResult.runs` lists the runs and
-`anchor_offsets` their anchors. On 423 CAPE 2025 P reads this took the bias spread from
-1.84 to 1.63 ms MAD and the reads with a shape error above 5 ms from 59 to 41, touching no
-channel on more than half of the reads (90th percentile of excluded channels: 32 %). If no
-run survives, `refine_phases` raises (`on_excluded="raise"`, default) or logs a warning
-and leaves the curve out of the result (`on_excluded="skip"`). Secondary phases (`SECONDARY`, `exclude_near` None) are
-never excluded: they meet their parent at the junction by construction.
+implemented. How a direct curve is kept clear of the other arrival (the `pre_mask` band, or
+the optional `exclude_near` rule) is described under "Refining one curve" above.
 
 ## das-focmec compatibility (`dasmccc.legacy`)
 
