@@ -227,3 +227,34 @@ def test_config_refuses_lags_outside_the_window():
     with pytest.raises(ValueError, match="pre_mask"):
         RefineConfig(window=100, pre_mask=100, pair_slope=0.1, corr_len=100)
     RefineConfig(window=200)  # the defaults are consistent
+
+
+def test_pre_mask_taper_weights_and_default_is_the_hard_cut(gather):
+    from dasmccc import RefineConfig, refine_curve
+    from dasmccc.pipeline import pre_mask_weights
+
+    w = pre_mask_weights(200, 100, 0)
+    assert w.sum() == 200 and w.min() == 1.0  # pre_mask = window // 2 keeps everything
+    w = pre_mask_weights(200, 40, 0)
+    assert (w[60:140] == 1).all() and (w[:60] == 0).all() and (w[140:] == 0).all()
+    w = pre_mask_weights(200, 40, 10)
+    assert (w[70:130] == 1).all() and (w[:60] == 0).all() and (w[140:] == 0).all()
+    assert (np.diff(w[60:70]) > 0).all() and (np.diff(w[130:140]) < 0).all()  # monotone edges
+    assert np.allclose(w[60:70], w[130:140][::-1]) and 0 < w[60] < 0.1 and 0.9 < w[69] < 1
+    with pytest.raises(ValueError, match="pre_mask_taper"):
+        RefineConfig(pre_mask=40, pre_mask_taper=41)
+    with pytest.raises(ValueError, match="pre_mask_taper"):
+        RefineConfig(pre_mask_taper=-1)
+    # taper 0 (the default) is the hard cut: the curve is unchanged from before the option
+    cfg = RefineConfig(pre_mask=60, anchor=None)
+    a = refine_curve(gather, initial_curve(), cfg)
+    b = refine_curve(
+        gather, initial_curve(), RefineConfig(pre_mask=60, pre_mask_taper=0, anchor=None)
+    )
+    assert np.array_equal(a.curve, b.curve, equal_nan=True)
+    # with a taper the synthetic moveout is still recovered
+    c = refine_curve(
+        gather, initial_curve(), RefineConfig(pre_mask=60, pre_mask_taper=15, anchor=None)
+    )
+    ok = np.isfinite(c.curve)
+    assert np.median(np.abs((c.curve - TRUE)[ok] - np.median((c.curve - TRUE)[ok]))) < 1.0

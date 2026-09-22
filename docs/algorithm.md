@@ -11,7 +11,8 @@ Input: a gather `waveform (n_channels, n_samples)` and an initial arrival `curve
 [2] align      each channel shifted by round(base - curve[c]) so its pick sits at the
                centre; window of +-window/2 cut around it; optional pre_mask keeps only
                +-pre_mask samples (100 of the 200-sample window by default: nothing
-               beyond 100 ms of the initial curve is ever correlated)
+               beyond 100 ms of the initial curve is ever correlated), with a cosine
+               edge of pre_mask_taper samples (0 by default: a hard cut)
 [3] passes     for i = 1 .. n_iter:
       (a) partners : for each channel, n_partners (50) candidates drawn as quantiles of a
                      normal distribution (std partner_std = 20 channels) truncated to

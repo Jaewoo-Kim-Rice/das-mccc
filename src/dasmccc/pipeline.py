@@ -42,6 +42,11 @@ class RefineConfig:
     medfilt_iters   : spatial median filter of the aligned gather after the listed passes.
     pre_mask        : keep only +-pre_mask samples around the alignment sample before the
                       first pass (None = off).
+    pre_mask_taper  : cosine edge of the pre-mask, in samples: the weight is 1 within
+                      +-(pre_mask - pre_mask_taper) and falls to 0 at +-pre_mask. 0 (default)
+                      is the hard cut. A hard edge at the same sample on every channel is a
+                      feature the correlation can lock onto (a bias towards zero lag, i.e.
+                      towards the initial curve); with a narrow pre-mask, use a taper.
     stack           : "norm" (default; every aligned trace divided by its rms before the
                       mean, so strong channels do not own the stack), "mean" (plain mean) or
                       "median" (channel-wise median).
@@ -95,6 +100,7 @@ class RefineConfig:
     medfilt_channels: int = 25
     medfilt_iters: tuple[int, ...] = (1, 2, 3)
     pre_mask: int | None = 100
+    pre_mask_taper: int = 0
     stack: str = "norm"
     stack_polarity: bool = False
     anchor: str | None = "first_lobe"
@@ -124,6 +130,12 @@ class RefineConfig:
         if self.pre_mask is not None and self.pre_mask > self.window // 2:
             raise ValueError(
                 f"pre_mask {self.pre_mask} must not exceed window // 2 = {self.window // 2}"
+            )
+        if self.pre_mask_taper < 0 or (
+            self.pre_mask is not None and self.pre_mask_taper > self.pre_mask
+        ):
+            raise ValueError(
+                f"pre_mask_taper {self.pre_mask_taper} must lie in [0, pre_mask = {self.pre_mask}]"
             )
 
 
@@ -218,6 +230,23 @@ def _coherence(aligned: np.ndarray, stack: np.ndarray, centre: int, half: int) -
     return np.abs(num / den)
 
 
+def pre_mask_weights(n: int, pre_mask: int, taper: int = 0) -> np.ndarray:
+    """(n,) weights of the pre-mask on a window whose alignment sample is n // 2: 1 within
+    +-(pre_mask - taper), a half-cosine from 1 to 0 over the last ``taper`` samples on each
+    side, 0 beyond +-pre_mask. taper = 0 is the hard cut (1 on [half - pre_mask, half +
+    pre_mask), 0 elsewhere)."""
+    half = n // 2
+    if not (0 <= taper <= pre_mask <= half):
+        raise ValueError(f"need 0 <= taper {taper} <= pre_mask {pre_mask} <= n // 2 {half}")
+    w = np.zeros(n)
+    w[half - pre_mask : half + pre_mask] = 1.0
+    if taper > 0:
+        ramp = 0.5 * (1.0 + np.cos(np.pi * np.arange(1, taper + 1) / (taper + 1)))  # 1 -> 0
+        w[half - pre_mask : half - pre_mask + taper] = ramp[::-1]  # rising edge
+        w[half + pre_mask - taper : half + pre_mask] = ramp  # falling edge
+    return w
+
+
 def refine_curve(
     waveform: np.ndarray,
     curve: np.ndarray,
@@ -271,11 +300,7 @@ def refine_curve(
     shifted, _ = shift_arr(sub, c, base)
     shifted = shifted[:, base - half : base + half]
     if cfg.pre_mask is not None:
-        keep = np.zeros_like(shifted)
-        keep[:, half - cfg.pre_mask : half + cfg.pre_mask] = shifted[
-            :, half - cfg.pre_mask : half + cfg.pre_mask
-        ]
-        shifted = keep
+        shifted = shifted * pre_mask_weights(2 * half, cfg.pre_mask, cfg.pre_mask_taper)
 
     aligned, total_tau, taus = iterate_align(
         shifted,
