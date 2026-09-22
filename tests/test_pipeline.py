@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from conftest import N_CH, RICKER_TROUGH, TRUE, initial_curve, make_gather
@@ -185,7 +187,8 @@ def test_refine_phases_excludes_channels_too_close_to_a_refined_curve(gather):
     # is inside exclude_near (170) and must not be refined; the two outer runs are
     p0 = TRUE - 250.0
     p0[100:200] = TRUE[100:200] - 60.0
-    out = refine_phases(gather, {"S": s0, "P": p0})
+    ex = RefineConfig(pre_mask=100, pre_mask_taper=0, exclude_near=170)  # the pre-0.2.0 rule
+    out = refine_phases(gather, {"S": s0, "P": p0}, cfg_by_tag={"P": ex})
     p = out["P"]
     assert p.runs == [(0, 99), (200, N_CH - 1)]
     assert not p.refined[100:200].any() and p.refined[:100].all() and p.refined[200:].all()
@@ -199,20 +202,25 @@ def test_refine_phases_excludes_channels_too_close_to_a_refined_curve(gather):
     # default bridge "shift": the gap carries the interpolated run-end shift
     assert abs(sh[150] - 0.5 * (np.median(sh[90:100]) + np.median(sh[200:210]))) < 1.5
     out2 = refine_phases(
-        gather, {"S": s0, "P": p0}, cfg_by_tag={"P": RefineConfig(bridge="initial")}
+        gather, {"S": s0, "P": p0}, cfg_by_tag={"P": replace(ex, bridge="initial")}
     )
     assert abs((out2["P"].curve - p0)[150]) < 1e-9  # mid-gap, beyond the tapers: the curve as drawn
     with pytest.raises(ValueError):
-        refine_phases(gather, {"S": s0, "P": p0}, cfg_by_tag={"P": RefineConfig(bridge="bogus")})
+        refine_phases(gather, {"S": s0, "P": p0}, cfg_by_tag={"P": replace(ex, bridge="bogus")})
     assert len(p.anchor_offsets) == 2 and p.anchor_offset in p.anchor_offsets
     # secondaries are never excluded (they meet their parent by construction)
     sp0 = TRUE + 10.0 + 0.6 * (150 - np.arange(N_CH))
     sp0[150:] = np.nan
     assert refine_phases(gather, {"S": s0, "SP": sp0})["SP"].runs is None
     with pytest.raises(ValueError):
-        refine_phases(gather, {"S": s0, "P": TRUE - 30.0})  # everything too close
-    out = refine_phases(gather, {"S": s0, "P": TRUE - 30.0}, on_excluded="skip")
+        refine_phases(gather, {"S": s0, "P": TRUE - 30.0}, cfg_by_tag={"P": ex})  # all too close
+    out = refine_phases(
+        gather, {"S": s0, "P": TRUE - 30.0}, cfg_by_tag={"P": ex}, on_excluded="skip"
+    )
     assert list(out) == ["S"]
+    # the default (no exclusion, +-40 tapered pre-mask) refines every channel
+    d = refine_phases(gather, {"S": s0, "P": p0})["P"]
+    assert d.runs is None and np.isfinite(d.coherence[100:200]).all()
 
 
 def test_config_refuses_lags_outside_the_window():
@@ -229,7 +237,7 @@ def test_config_refuses_lags_outside_the_window():
     RefineConfig(window=200)  # the defaults are consistent
 
 
-def test_pre_mask_taper_weights_and_default_is_the_hard_cut(gather):
+def test_pre_mask_taper_weights_and_zero_is_the_hard_cut(gather):
     from dasmccc import RefineConfig, refine_curve
     from dasmccc.pipeline import pre_mask_weights
 
@@ -245,8 +253,8 @@ def test_pre_mask_taper_weights_and_default_is_the_hard_cut(gather):
         RefineConfig(pre_mask=40, pre_mask_taper=41)
     with pytest.raises(ValueError, match="pre_mask_taper"):
         RefineConfig(pre_mask_taper=-1)
-    # taper 0 (the default) is the hard cut: the curve is unchanged from before the option
-    cfg = RefineConfig(pre_mask=60, anchor=None)
+    # taper 0 is the hard cut: the curve is unchanged from before the option existed
+    cfg = RefineConfig(pre_mask=60, pre_mask_taper=0, anchor=None)
     a = refine_curve(gather, initial_curve(), cfg)
     b = refine_curve(
         gather, initial_curve(), RefineConfig(pre_mask=60, pre_mask_taper=0, anchor=None)

@@ -74,7 +74,8 @@ spacing `dx` (m) converts as follows and should log the resulting configuration:
 | `medfilt_channels` | 25 ch | 50 m | m / dx, rounded to odd |
 | `anchor_guard`, `coherence_half` | 40, 30 samples | 40 ms, 30 ms | ms x fs / 1000 |
 | `anchor_window` | (-30, 10) samples | (-30, 10) ms | ms x fs / 1000 |
-| `exclude_near` | 170 samples (None for SECONDARY) | 170 ms | ms x fs / 1000 |
+| `pre_mask`, `pre_mask_taper` | 40, 10 samples (50, 0 for SECONDARY) | 40 ms, 10 ms | ms x fs / 1000 |
+| `exclude_near` | None (170 before 0.2.0) | ms | ms x fs / 1000 |
 | `polarity.half_win`, `max_lag` | 30, 10 samples | 30 ms, 10 ms | ms x fs / 1000 |
 | `polarity.fs`, `ricker_hz` | 1000, 50 | 50 Hz Ricker | set `fs`; keep `ricker_hz` |
 | `smoothness`, `lamb`, `n_iter`, `n_partners` | 50, 1, 4, 50 | dimensionless | unchanged |
@@ -157,11 +158,20 @@ Blanking the junction would let the child drift there (measured: junction |dt| 0
 `cfg_by_tag` says otherwise. Re-imposing the junction as a constraint on the child is not
 implemented.
 
-**Exclusion of interfering channels (`exclude_near`).** A direct curve (`DIRECT`,
-`exclude_near` 170 samples) is not refined where its initial curve comes within that many
-samples of a curve refined before it: with the S inside the P correlation window (+-100)
-the pairwise correlations lock on the S and the stack is S energy, and no mask width fixes
-it (tested 45 to 75 samples, relative or anchored centre). The runs of at least `min_run`
+**Keeping the other arrival out (`pre_mask`, since 0.2.0).** DIRECT keeps +-40 samples of
+the aligned gather around the initial curve, with a 10-sample cosine edge, before the
+first pass: an S 50 or more samples behind the P is never correlated, and every channel is
+refined. On 616 CAPE 2025 reads against human picks this beat the exclusion below on every
+P and S figure (P shape 2.05 -> 1.88 ms, S 4.44 -> 3.95, S gross errors 81 -> 70, reads
+with shape error above 5 ms P 52 -> 41 and S 250 -> 210). The bound is the band: an
+initial curve more than 40 samples off is not recovered, and its per-channel coherence is
+low (11.VLM_phase_labeling `docs/17_pre_mask_grid.md`).
+
+**Exclusion of interfering channels (`exclude_near`, optional; the default before 0.2.0).**
+A direct curve with `exclude_near` 170 samples is not refined where its initial curve comes
+within that many samples of a curve refined before it: with the S inside a +-100 correlation
+window the pairwise correlations lock on the S and the stack is S energy, and no S-centred
+mask width fixes it (tested 45 to 75 samples, relative or anchored centre). The runs of at least `min_run`
 (60) channels that stay clear are refined separately, each with its own anchor. The
 excluded channels are not dropped: they follow the initial curve as drawn, joined to the
 refined runs by tapering the run-end shift to zero over 50 channels, so the curve stays

@@ -23,7 +23,8 @@ def test_legacy_matches_refine_curve_without_anchor(gather):
             smoothness=50.0,
             pre_mccc_mask_half_width=100,
         )
-    res = refine_curve(gather, curve, RefineConfig(anchor=None))
+    # the legacy path is the pre-0.2.0 direct setting: whole-window pre-mask, hard cut
+    res = refine_curve(gather, curve, RefineConfig(pre_mask=100, pre_mask_taper=0, anchor=None))
     assert len(arrs) == 6 and arrs[0] is gather
     assert np.array_equal(arrs[-1], res.aligned)
     assert np.allclose(base_time - total_shift, res.curve)

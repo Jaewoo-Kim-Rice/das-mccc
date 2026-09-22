@@ -4,7 +4,7 @@ from dasmccc import refine_curve, DIRECT
 res = refine_curve(waveform, curve, DIRECT)   # arrays in, RefineResult out
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 from .anchor import first_lobe, stack_peak
 from .core import iterate_align, mccc, pairwise_lags, partner_pairs, solve_tau

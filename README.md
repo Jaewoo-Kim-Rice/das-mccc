@@ -39,8 +39,8 @@ res.polarity       # -1 / 0 / +1 per channel
 res.snr, res.coherence, res.kept
 res.aligned, res.stack   # the aligned window and its stack, for plots
 
-# several phases of one gather, strongest first; refined phases are masked for the next, and
-# a direct curve is not refined where it runs within 170 samples of one (res.runs, res.refined)
+# several phases of one gather, strongest first; refined phases are masked for the next and a
+# narrow tapered pre-mask (+-40 samples, 10 taper) keeps them out of the correlation
 out = refine_phases(waveform, {"S": s_curve, "P": p_curve, "SP": sp_curve})
 # several curves of one tag: any keys, plus a key -> tag map
 out = refine_phases(waveform, {"S": s_curve, "R1": r1, "R2": r2},

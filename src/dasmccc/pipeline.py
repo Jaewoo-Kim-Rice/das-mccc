@@ -41,12 +41,16 @@ class RefineConfig:
     medfilt_channels,
     medfilt_iters   : spatial median filter of the aligned gather after the listed passes.
     pre_mask        : keep only +-pre_mask samples around the alignment sample before the
-                      first pass (None = off).
+                      first pass (None = off). DIRECT: 40, so that another arrival more than
+                      ~50 samples away (an S behind a P) stays outside what is correlated;
+                      the price is that an initial curve more than 40 samples off is not
+                      recovered (its coherence says so). Was 100 (= the whole window) before
+                      0.2.0, with exclude_near doing that job by dropping channels.
     pre_mask_taper  : cosine edge of the pre-mask, in samples: the weight is 1 within
-                      +-(pre_mask - pre_mask_taper) and falls to 0 at +-pre_mask. 0 (default)
-                      is the hard cut. A hard edge at the same sample on every channel is a
-                      feature the correlation can lock onto (a bias towards zero lag, i.e.
-                      towards the initial curve); with a narrow pre-mask, use a taper.
+                      +-(pre_mask - pre_mask_taper) and falls to 0 at +-pre_mask. 0 is the
+                      hard cut. A hard edge at the same sample on every channel is a feature
+                      the correlation can lock onto (a bias towards zero lag, i.e. towards
+                      the initial curve); with a narrow pre-mask, use a taper (DIRECT: 10).
     stack           : "norm" (default; every aligned trace divided by its rms before the
                       mean, so strong channels do not own the stack), "mean" (plain mean) or
                       "median" (channel-wise median).
@@ -67,13 +71,15 @@ class RefineConfig:
                       within exclude_near samples of a curve refined before it are not
                       refined at all: another arrival inside the correlation window
                       corrupts the alignment and the stack (a P within 170 ms of the S:
-                      the window is +-100 and the S wavelet's leading lobes reach well
-                      beyond the S curve). The remaining runs of at least ``min_run`` channels
+                      with a +-100 window the S wavelet's leading lobes reach well beyond
+                      the S curve). The remaining runs of at least ``min_run`` channels
                       are refined separately, each with its own anchor, and the excluded
                       channels are bridged so the result stays continuous (see ``bridge``
-                      and RefineResult.runs). None = off, which is what SECONDARY uses: a
-                      converted or reflected phase meets its parent at the junction by
-                      construction (see the junction guard).
+                      and RefineResult.runs). None (default since 0.2.0): the narrow
+                      tapered pre-mask keeps the other arrival out instead, and every
+                      channel is refined; on 616 CAPE 2025 reads this beat exclusion at 170
+                      on every P and S figure. SECONDARY never excludes: a converted or
+                      reflected phase meets its parent at the junction by construction.
     bridge          : how excluded channels are filled. "shift" (default): the initial
                       curve's shape carried at the refined level, the shift (refined minus
                       initial at the run ends) interpolated linearly across a gap and held
@@ -99,8 +105,8 @@ class RefineConfig:
     tau_avg: int = 100
     medfilt_channels: int = 25
     medfilt_iters: tuple[int, ...] = (1, 2, 3)
-    pre_mask: int | None = 100
-    pre_mask_taper: int = 0
+    pre_mask: int | None = 40
+    pre_mask_taper: int = 10
     stack: str = "norm"
     stack_polarity: bool = False
     anchor: str | None = "first_lobe"
@@ -108,7 +114,7 @@ class RefineConfig:
     anchor_guard: int | None = 40
     anchor_contiguous: bool = True
     anchor_window: tuple[int, int] | None = (-30, 10)
-    exclude_near: int | None = 170
+    exclude_near: int | None = None
     min_run: int = 60
     bridge: str = "shift"
     coherence_half: int = 30
