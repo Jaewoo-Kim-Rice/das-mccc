@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,24 @@ version = "0.2.0"
 description = "Iterative network MCCC refinement of DAS arrival curves with absolute anchoring and Ricker polarity QC"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Jaewoo Kim", email = "jk103@rice.edu"}]
+keywords = ["DAS", "distributed acoustic sensing", "microseismic", "cross-correlation", "phase picking"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = ["numpy", "scipy"]
 
 [project.urls]
 Repository = "https://github.com/Jaewoo-Kim-Rice/das-mccc"
+Algorithm = "https://github.com/Jaewoo-Kim-Rice/das-mccc/blob/main/docs/algorithm.md"
 
 [project.optional-dependencies]
 numba = ["numba"]
