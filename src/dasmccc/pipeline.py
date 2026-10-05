@@ -95,6 +95,15 @@ class RefineConfig:
                       ``local_gap`` channels on each side are left out of that stack so a
                       trace is not compared with itself and its near-identical neighbours.
                       0 switches the local measure off (coherence_local all NaN).
+    coherence_template : "plain" (default): the coherence templates (global and local) are
+                      the mean of the rms-normalised traces as they are. "sign": each trace
+                      is first flipped to the sign of its correlation with the template
+                      (``coherence_half`` window), the template re-stacked, ``sign_iters``
+                      rounds from the plain stack; the polarity reversal along a fibre that
+                      a real S wave shows then no longer cancels the template. The anchor
+                      stack is not affected (the plain stack scored better for the anchor).
+                      ``RefineResult.coherence_signs`` records the signs.
+    sign_iters      : rounds of the "sign" template (5).
     polarity        : Ricker polarity / SNR / MMAD settings.
     """
 
@@ -125,6 +134,8 @@ class RefineConfig:
     coherence_half: int = 30
     local_half: int = 100
     local_gap: int = 10
+    coherence_template: str = "plain"
+    sign_iters: int = 5
     polarity: PolarityConfig = field(default_factory=PolarityConfig)
 
     def __post_init__(self):
@@ -194,6 +205,9 @@ class RefineResult:
     anchor_offsets: the anchor offset of each run (``anchor_offset`` is the longest run's).
     refined       : (n_channels,) bool, see ``runs``; None when nothing was excluded.
     taus          : tau of each pass on the refined channel range.
+    coherence_signs: (n_channels,) +-1 sign each trace was given in the coherence templates
+                    (RefineConfig.coherence_template "sign"); all +1 for "plain"; NaN where
+                    not refined.
     """
 
     curve: np.ndarray
@@ -213,6 +227,7 @@ class RefineResult:
     coherence_local: np.ndarray | None = None
     anchor_offsets: list[float] | None = None
     refined: np.ndarray | None = None
+    coherence_signs: np.ndarray | None = None
 
     @property
     def curve_relative(self) -> np.ndarray:
@@ -240,6 +255,39 @@ def _stack(aligned: np.ndarray, cfg: RefineConfig, polarity: np.ndarray) -> np.n
     raise ValueError(f"unknown stack kind {cfg.stack!r}")
 
 
+def _normed(aligned: np.ndarray) -> np.ndarray:
+    """Each finite row divided by its rms; non-finite rows set to 0."""
+    finite = np.isfinite(aligned).all(axis=1)
+    rms = np.sqrt(np.nanmean(aligned**2, axis=1))
+    rms[~np.isfinite(rms) | (rms == 0)] = 1.0
+    return np.where(finite[:, None], aligned / rms[:, None], 0.0)
+
+
+def coherence_signs(aligned: np.ndarray, centre: int, half: int, n_iter: int) -> np.ndarray:
+    """(n,) +-1: the sign of each trace's correlation with the normalised stack of all traces
+    within +-half of `centre`, the stack re-made with the signs applied, `n_iter` rounds from
+    the plain stack (stopping early once the signs no longer change); the majority sign is +1.
+    A zero correlation keeps +1. With n_iter 0 every sign is +1."""
+    normed = _normed(aligned)
+    w = slice(centre - half, centre + half)
+    t = normed[:, w] - normed[:, w].mean(axis=1, keepdims=True)
+    sg = np.ones(aligned.shape[0])
+    for _ in range(n_iter):
+        s = (normed * sg[:, None]).mean(axis=0)[w]
+        s = s - s.mean()
+        new = np.sign(t @ s)
+        new[new == 0] = 1.0
+        if np.array_equal(new, sg):
+            break
+        sg = new
+    # a global flip is arbitrary: the majority is +1, on a tie the first finite trace
+    finite = np.isfinite(aligned).all(axis=1)
+    first = int(np.argmax(finite)) if finite.any() else 0
+    if sg[finite].sum() < 0 or (sg[finite].sum() == 0 and sg[first] < 0):
+        sg = -sg
+    return sg
+
+
 def _coherence(aligned: np.ndarray, stack: np.ndarray, centre: int, half: int) -> np.ndarray:
     w = slice(centre - half, centre + half)
     s = stack[w] - stack[w].mean()
@@ -249,18 +297,26 @@ def _coherence(aligned: np.ndarray, stack: np.ndarray, centre: int, half: int) -
     return np.abs(num / den)
 
 
-def _local_coherence(aligned: np.ndarray, centre: int, half: int, local_half: int, gap: int) -> np.ndarray:
+def _local_coherence(
+    aligned: np.ndarray,
+    centre: int,
+    half: int,
+    local_half: int,
+    gap: int,
+    signs: np.ndarray | None = None,
+) -> np.ndarray:
     """(n,) coherence of each aligned trace with the normalised stack of its neighbours
-    gap < |dj| <= local_half (finite rows only), within +-half of `centre`; NaN where fewer
-    than 10 neighbours exist or local_half is 0."""
+    gap < |dj| <= local_half (finite rows only; each multiplied by its sign when `signs` is
+    given), within +-half of `centre`; NaN where fewer than 10 neighbours exist or local_half
+    is 0."""
     n = aligned.shape[0]
     out = np.full(n, np.nan)
     if local_half <= 0:
         return out
     finite = np.isfinite(aligned).all(axis=1)
-    rms = np.sqrt(np.nanmean(aligned**2, axis=1))
-    rms[~np.isfinite(rms) | (rms == 0)] = 1.0
-    normed = np.where(finite[:, None], aligned / rms[:, None], 0.0)
+    normed = _normed(aligned)
+    if signs is not None:
+        normed = normed * signs[:, None]
     w = slice(centre - half, centre + half)
     for i in np.flatnonzero(finite):
         j = np.arange(max(0, i - local_half), min(n, i + local_half + 1))
@@ -382,8 +438,19 @@ def refine_curve(
         raise ValueError(f"unknown anchor rule {cfg.anchor!r}")
     refined = relative + (offset if np.isfinite(offset) else 0.0)
 
-    coh = _coherence(aligned, stack, half, cfg.coherence_half)
-    coh_local = _local_coherence(aligned, half, cfg.coherence_half, cfg.local_half, cfg.local_gap)
+    # the coherence templates; the anchor keeps the plain stack (see RefineConfig)
+    if cfg.coherence_template == "sign":
+        signs = coherence_signs(aligned, half, cfg.coherence_half, cfg.sign_iters)
+        coh_stack = (_normed(aligned) * signs[:, None]).mean(axis=0)
+    elif cfg.coherence_template == "plain":
+        signs = np.ones(aligned.shape[0])
+        coh_stack = stack
+    else:
+        raise ValueError(f"unknown coherence_template {cfg.coherence_template!r}")
+    coh = _coherence(aligned, coh_stack, half, cfg.coherence_half)
+    coh_local = _local_coherence(
+        aligned, half, cfg.coherence_half, cfg.local_half, cfg.local_gap, signs
+    )
 
     def full(values, fill):
         out = np.full(n_ch, fill, dtype=float)
@@ -413,6 +480,7 @@ def refine_curve(
         qc=qc_sub,
         channel_range=(lo, hi),
         coherence_local=full(coh_local, np.nan),
+        coherence_signs=full(signs, np.nan),
     )
 
 
@@ -559,6 +627,7 @@ def _refine_runs(
         stack=longest.stack,
         coherence=np.full(child0.shape, np.nan),
         coherence_local=np.full(child0.shape, np.nan),
+        coherence_signs=np.full(child0.shape, np.nan),
         polarity=np.zeros(child0.shape),
         snr=np.full(child0.shape, np.nan),
         kept=np.zeros(child0.shape, bool),
@@ -570,7 +639,16 @@ def _refine_runs(
         anchor_offsets=[p[1].anchor_offset for p in parts],
     )
     for run, r in parts:
-        for name in ("curve", "shifts", "coherence", "coherence_local", "polarity", "snr", "kept"):
+        for name in (
+            "curve",
+            "shifts",
+            "coherence",
+            "coherence_local",
+            "coherence_signs",
+            "polarity",
+            "snr",
+            "kept",
+        ):
             getattr(out, name)[run] = getattr(r, name)[run]
     refined = np.isfinite(out.curve)
     _bridge(out, child0, [p[0] for p in parts], cfg.bridge)

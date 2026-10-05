@@ -4,7 +4,7 @@ from dasmccc import refine_curve, DIRECT
 res = refine_curve(waveform, curve, DIRECT)   # arrays in, RefineResult out
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .anchor import first_lobe, stack_peak
 from .core import iterate_align, mccc, pairwise_lags, partner_pairs, solve_tau
@@ -14,6 +14,7 @@ from .pipeline import (
     NothingToRefine,
     RefineConfig,
     RefineResult,
+    coherence_signs,
     refine_curve,
     refine_phases,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "__version__",
     "NUMBA_AVAILABLE",
     "NothingToRefine",
+    "coherence_signs",
     "SECONDARY",
     "PolarityConfig",
     "PolarityResult",

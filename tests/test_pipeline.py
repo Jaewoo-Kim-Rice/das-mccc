@@ -284,7 +284,9 @@ def test_local_coherence_separates_a_changing_waveform_from_noise():
         # three stretches with pulses of period 12, 40 and 100 samples: neighbours alike
         # (local high), the one stack of the whole curve a mixture no trace resembles well
         per = (12, 40, 100)[min(c // 200, 2)]
-        x[c] = np.exp(-0.5 * ((t - picks[c]) / (per / 2.5)) ** 2) * np.cos(2 * np.pi * (t - picks[c]) / per)
+        x[c] = np.exp(-0.5 * ((t - picks[c]) / (per / 2.5)) ** 2) * np.cos(
+            2 * np.pi * (t - picks[c]) / per
+        )
     x += 0.05 * rng.standard_normal(x.shape)
     cfg = RefineConfig(anchor=None, pre_mask=None, exclude_near=None)
     res = refine_curve(x, picks, cfg)
@@ -293,5 +295,22 @@ def test_local_coherence_separates_a_changing_waveform_from_noise():
     noise = rng.standard_normal(x.shape)
     nres = refine_curve(noise, picks, cfg)
     assert np.nanmedian(nres.coherence_local) < 0.7 and np.nanmedian(nres.coherence) < 0.5
-    off = refine_curve(x, picks, RefineConfig(anchor=None, pre_mask=None, exclude_near=None, local_half=0))
+    off = refine_curve(
+        x, picks, RefineConfig(anchor=None, pre_mask=None, exclude_near=None, local_half=0)
+    )
     assert np.isnan(off.coherence_local).all()
+
+
+def test_sign_template_keeps_the_coherence_through_a_reversal_and_the_anchor_plain():
+    x = make_gather(flip_from=150)
+    plain = refine_curve(x, initial_curve(), DIRECT)
+    signed = refine_curve(x, initial_curve(), RefineConfig(coherence_template="sign"))
+    assert np.nanmedian(plain.coherence) < 0.5  # the plain template cancels
+    assert np.nanmedian(signed.coherence) > 0.9
+    assert np.nanmedian(signed.coherence_local) > 0.9
+    assert (signed.coherence_signs[:150] == 1).all()
+    assert (signed.coherence_signs[150:] == -1).all()
+    assert (plain.coherence_signs == 1).all()
+    # the picks and the anchor do not depend on the coherence template
+    assert np.allclose(signed.curve, plain.curve, equal_nan=True)
+    assert signed.anchor_offset == plain.anchor_offset
