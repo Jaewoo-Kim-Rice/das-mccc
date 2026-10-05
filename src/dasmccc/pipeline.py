@@ -90,6 +90,11 @@ class RefineConfig:
                       differs from the refined one); "initial" is right where the picker
                       happened to sit on the onset lobe.
     coherence_half  : half window (samples) for the trace-vs-stack coherence.
+    local_half      : half width (channels) of the neighbourhood whose normalised stack each
+                      trace is also correlated with (``coherence_local``); the nearest
+                      ``local_gap`` channels on each side are left out of that stack so a
+                      trace is not compared with itself and its near-identical neighbours.
+                      0 switches the local measure off (coherence_local all NaN).
     polarity        : Ricker polarity / SNR / MMAD settings.
     """
 
@@ -118,6 +123,8 @@ class RefineConfig:
     min_run: int = 60
     bridge: str = "shift"
     coherence_half: int = 30
+    local_half: int = 100
+    local_gap: int = 10
     polarity: PolarityConfig = field(default_factory=PolarityConfig)
 
     def __post_init__(self):
@@ -168,6 +175,11 @@ class RefineResult:
     stack         : mean of the finite rows of ``aligned`` (polarity-corrected if asked).
     coherence     : |normalised correlation| of each aligned trace with the stack within
                     +-coherence_half samples of the alignment sample.
+    coherence_local: the same correlation of each trace with the normalised stack of its
+                    neighbours (local_gap < |dj| <= local_half channels, finite rows only);
+                    NaN with fewer than 10 such neighbours or local_half 0. Low with the
+                    global measure means noise; high with the global measure low means the
+                    waveform changes along the curve.
     polarity, snr : from the Ricker step (0 / NaN where undetermined).
     kept          : input finite and not an amplitude outlier and snr >= threshold.
     anchor_offset : samples added to the relative level (0 when anchor is None, NaN when
@@ -198,6 +210,7 @@ class RefineResult:
     channel_range: tuple[int, int]
     parent: str | None = None
     runs: list[tuple[int, int]] | None = None
+    coherence_local: np.ndarray | None = None
     anchor_offsets: list[float] | None = None
     refined: np.ndarray | None = None
 
@@ -234,6 +247,31 @@ def _coherence(aligned: np.ndarray, stack: np.ndarray, centre: int, half: int) -
     num = t @ s
     den = np.linalg.norm(t, axis=1) * np.linalg.norm(s) + 1e-12
     return np.abs(num / den)
+
+
+def _local_coherence(aligned: np.ndarray, centre: int, half: int, local_half: int, gap: int) -> np.ndarray:
+    """(n,) coherence of each aligned trace with the normalised stack of its neighbours
+    gap < |dj| <= local_half (finite rows only), within +-half of `centre`; NaN where fewer
+    than 10 neighbours exist or local_half is 0."""
+    n = aligned.shape[0]
+    out = np.full(n, np.nan)
+    if local_half <= 0:
+        return out
+    finite = np.isfinite(aligned).all(axis=1)
+    rms = np.sqrt(np.nanmean(aligned**2, axis=1))
+    rms[~np.isfinite(rms) | (rms == 0)] = 1.0
+    normed = np.where(finite[:, None], aligned / rms[:, None], 0.0)
+    w = slice(centre - half, centre + half)
+    for i in np.flatnonzero(finite):
+        j = np.arange(max(0, i - local_half), min(n, i + local_half + 1))
+        j = j[(np.abs(j - i) > gap) & finite[j]]
+        if len(j) < 10:
+            continue
+        s = normed[j, w].mean(axis=0)
+        s = s - s.mean()
+        t = aligned[i, w] - aligned[i, w].mean()
+        out[i] = abs(t @ s) / (np.linalg.norm(t) * np.linalg.norm(s) + 1e-12)
+    return out
 
 
 def pre_mask_weights(n: int, pre_mask: int, taper: int = 0) -> np.ndarray:
@@ -345,6 +383,7 @@ def refine_curve(
     refined = relative + (offset if np.isfinite(offset) else 0.0)
 
     coh = _coherence(aligned, stack, half, cfg.coherence_half)
+    coh_local = _local_coherence(aligned, half, cfg.coherence_half, cfg.local_half, cfg.local_gap)
 
     def full(values, fill):
         out = np.full(n_ch, fill, dtype=float)
@@ -373,6 +412,7 @@ def refine_curve(
         taus=taus,
         qc=qc_sub,
         channel_range=(lo, hi),
+        coherence_local=full(coh_local, np.nan),
     )
 
 
@@ -518,6 +558,7 @@ def _refine_runs(
         aligned=longest.aligned,
         stack=longest.stack,
         coherence=np.full(child0.shape, np.nan),
+        coherence_local=np.full(child0.shape, np.nan),
         polarity=np.zeros(child0.shape),
         snr=np.full(child0.shape, np.nan),
         kept=np.zeros(child0.shape, bool),
@@ -529,7 +570,7 @@ def _refine_runs(
         anchor_offsets=[p[1].anchor_offset for p in parts],
     )
     for run, r in parts:
-        for name in ("curve", "shifts", "coherence", "polarity", "snr", "kept"):
+        for name in ("curve", "shifts", "coherence", "coherence_local", "polarity", "snr", "kept"):
             getattr(out, name)[run] = getattr(r, name)[run]
     refined = np.isfinite(out.curve)
     _bridge(out, child0, [p[0] for p in parts], cfg.bridge)

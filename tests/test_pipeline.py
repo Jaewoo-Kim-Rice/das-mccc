@@ -266,3 +266,32 @@ def test_pre_mask_taper_weights_and_zero_is_the_hard_cut(gather):
     )
     ok = np.isfinite(c.curve)
     assert np.median(np.abs((c.curve - TRUE)[ok] - np.median((c.curve - TRUE)[ok]))) < 1.0
+
+
+def test_local_coherence_separates_a_changing_waveform_from_noise():
+    """A waveform whose pulse changes along the fibre: every trace resembles its neighbours
+    (local high) but not the one stack of the whole curve (global lower). Noise: both low."""
+    import numpy as np
+
+    from dasmccc.pipeline import RefineConfig, refine_curve
+
+    rng = np.random.default_rng(0)
+    n_ch, n = 600, 1200
+    t = np.arange(n)
+    x = np.zeros((n_ch, n))
+    picks = 500 + 0.2 * np.arange(n_ch)
+    for c in range(n_ch):
+        # three stretches with pulses of period 12, 40 and 100 samples: neighbours alike
+        # (local high), the one stack of the whole curve a mixture no trace resembles well
+        per = (12, 40, 100)[min(c // 200, 2)]
+        x[c] = np.exp(-0.5 * ((t - picks[c]) / (per / 2.5)) ** 2) * np.cos(2 * np.pi * (t - picks[c]) / per)
+    x += 0.05 * rng.standard_normal(x.shape)
+    cfg = RefineConfig(anchor=None, pre_mask=None, exclude_near=None)
+    res = refine_curve(x, picks, cfg)
+    g, l = np.nanmedian(res.coherence), np.nanmedian(res.coherence_local)
+    assert l > 0.95 and g < 0.75, (g, l)
+    noise = rng.standard_normal(x.shape)
+    nres = refine_curve(noise, picks, cfg)
+    assert np.nanmedian(nres.coherence_local) < 0.7 and np.nanmedian(nres.coherence) < 0.5
+    off = refine_curve(x, picks, RefineConfig(anchor=None, pre_mask=None, exclude_near=None, local_half=0))
+    assert np.isnan(off.coherence_local).all()
