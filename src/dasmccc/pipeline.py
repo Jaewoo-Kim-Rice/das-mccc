@@ -572,11 +572,18 @@ def refine_phases(
                 res.anchor_offset = float("nan")
             else:
                 off = results[parent_key].anchor_offset
-                off = 0.0 if not np.isfinite(off) else off
-                res.curve = res.curve + off
-                res.shifts = res.shifts + off
-                res.anchor_offset = float(off)
                 res.parent = parent_key
+                if not np.isfinite(off):
+                    # the parent's own anchor was refused or inherited nothing: the child
+                    # keeps its relative level and says so (NaN), not a finite 0.0
+                    log.warning(
+                        "%s (%s): parent %s has no anchor; level kept", key, tag, parent_key
+                    )
+                    res.anchor_offset = float("nan")
+                else:
+                    res.curve = res.curve + off
+                    res.shifts = res.shifts + off
+                    res.anchor_offset = float(off)
         results[key] = res
     return results
 

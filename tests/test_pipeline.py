@@ -314,3 +314,26 @@ def test_sign_template_keeps_the_coherence_through_a_reversal_and_the_anchor_pla
     # the picks and the anchor do not depend on the coherence template
     assert np.allclose(signed.curve, plain.curve, equal_nan=True)
     assert signed.anchor_offset == plain.anchor_offset
+
+
+def test_a_child_of_a_parent_without_an_anchor_keeps_nan_not_zero(caplog):
+    import logging
+
+    from dasmccc import refine_phases
+
+    x = make_gather()
+    base = initial_curve()
+    # the parent refuses its anchor (guard 0: every offset is too large); the child inherits
+    parent_cfg = RefineConfig(anchor_guard=0)
+    child_cfg = RefineConfig(anchor="parent", pre_mask=None)
+    with caplog.at_level(logging.WARNING):
+        out = refine_phases(
+            x,
+            {"S": base, "SP": base + 5.0},
+            order=("S", "SP"),
+            cfg_by_tag={"S": parent_cfg, "SP": child_cfg},
+        )
+    assert np.isnan(out["S"].anchor_offset)
+    assert out["SP"].parent == "S" and np.isnan(out["SP"].anchor_offset)
+    assert np.allclose(out["SP"].curve, out["SP"].curve_relative, equal_nan=True)
+    assert any("has no anchor; level kept" in r.message for r in caplog.records)
