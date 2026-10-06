@@ -290,8 +290,8 @@ def test_local_coherence_separates_a_changing_waveform_from_noise():
     x += 0.05 * rng.standard_normal(x.shape)
     cfg = RefineConfig(anchor=None, pre_mask=None, exclude_near=None)
     res = refine_curve(x, picks, cfg)
-    g, l = np.nanmedian(res.coherence), np.nanmedian(res.coherence_local)
-    assert l > 0.95 and g < 0.75, (g, l)
+    g, loc = np.nanmedian(res.coherence), np.nanmedian(res.coherence_local)
+    assert loc > 0.95 and g < 0.75, (g, loc)
     noise = rng.standard_normal(x.shape)
     nres = refine_curve(noise, picks, cfg)
     assert np.nanmedian(nres.coherence_local) < 0.7 and np.nanmedian(nres.coherence) < 0.5
