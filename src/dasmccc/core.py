@@ -198,6 +198,11 @@ def iterate_align(
     refined arrival of channel c is ``round(initial_pick[c]) + total_tau[c]`` in the
     original sample axis, plus the channel-scale part of the initial fraction with
     ``RefineConfig.keep_subsample`` (see ``pipeline.refine_curve``).
+
+    The gather is advanced by ``round(tau)`` each pass while ``total_tau`` sums the float
+    tau, so a part below half a sample that was not applied is measured and added again by
+    the next pass (up to (n_iter - 1) * 0.5 samples in total). Kept as in the legacy loop;
+    see docs/algorithm.md, "Sub-sample accounting".
     """
     taus = []
     total = np.zeros(aligned.shape[0])

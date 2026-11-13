@@ -62,6 +62,17 @@ What the knobs mean physically:
   that the earlier median filters have already replaced isolated bad channels by their
   neighbours; an amplitude outlier narrower than `medfilt_channels` is not visible to the
   MMAD test.
+* Sub-sample accounting: each pass advances the gather by `round(tau)` but adds the float
+  tau to the total, so a part below half a sample is not applied, is measured again by the
+  next pass and is added again. The total can exceed the residual by up to
+  `(n_iter - 1) * 0.5` samples (1.5 with 4 passes), most where the residual is a smooth
+  sub-sample offset: on a synthetic smooth step of +-0.45 samples with exact initial picks,
+  4 passes returned about +-1.15. das-focmec's legacy loop counts the same way, and the
+  default keeps it for exact reproduction. Two alternatives were tried, counting only the
+  applied integer shifts plus the last tau, and shifting the gather by the float tau each
+  pass. Neither was better in every synthetic (both were worse when the initial curve is
+  several samples off), and on 25 CAPE reads they changed the scores against the human
+  picks by less than 0.06 ms.
 
 ## Settings in physical units
 
