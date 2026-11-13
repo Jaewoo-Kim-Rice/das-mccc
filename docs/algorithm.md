@@ -29,7 +29,13 @@ Input: a gather `waveform (n_channels, n_samples)` and an initial arrival `curve
                      medfilt_iters (1, 2, 3) the gather is median filtered along the fibre
                      with medfilt_channels (25)
 [4] relative   curve_relative = round(curve) + sum of tau (the level of the initial curve
-               is preserved: MCCC measures only relative delays)
+               is preserved: MCCC measures only relative delays). The fraction
+               f = curve - round(curve) is lost: tau is too smooth to carry it, so every
+               pick carries up to +-0.5 samples of rounding. keep_subsample=True (off by
+               default) adds back f - moving_avg(f, tau_avg): the part of the fraction that
+               changes from channel to channel. The slowly changing part is left out because
+               MCCC already measures it in tau (adding it again counts it twice; on a
+               synthetic smooth step of +-0.45 samples that doubled the error)
 [5] QC         Ricker polarity / SNR / MMAD on the aligned gather (below)
 [6] stack      channel-normalised mean of the aligned traces (`stack`: "norm", "mean" or
                "median"; stack_polarity=True multiplies each trace by its polarity first)
@@ -236,6 +242,7 @@ the deprecation warning.
 | `partner_pairs`, `pairwise_lags`, `solve_tau`, `mccc`, `iterate_align` | | the building blocks of one pass and of the iteration |
 
 Sign conventions: `tau > 0` means the channel arrives later than its partners (the
-aligned trace is advanced by tau); the refined arrival is `round(curve) + sum(tau)`.
+aligned trace is advanced by tau); the refined arrival is `round(curve) + sum(tau)`, plus
+`f - moving_avg(f, tau_avg)` with `f = curve - round(curve)` when `keep_subsample` is set.
 `limited_cc(tr, other, m)[k]` is the correlation at lag `k - m`, positive when `tr` is the
 delayed one.

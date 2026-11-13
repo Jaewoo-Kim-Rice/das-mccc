@@ -196,7 +196,8 @@ def iterate_align(
     filters the gather along the fibre when i is in ``medfilt_iters``. Returns
     (aligned, total_tau, taus); ``total_tau`` (n_channels,) is the summed tau, so the
     refined arrival of channel c is ``round(initial_pick[c]) + total_tau[c]`` in the
-    original sample axis (see ``pipeline.refine_curve``).
+    original sample axis, plus the channel-scale part of the initial fraction with
+    ``RefineConfig.keep_subsample`` (see ``pipeline.refine_curve``).
     """
     taus = []
     total = np.zeros(aligned.shape[0])

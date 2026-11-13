@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from conftest import N_CH, RICKER_TROUGH, TRUE, initial_curve, make_gather
+from conftest import FS, N_CH, RICKER_TROUGH, TRUE, N, initial_curve, make_gather
 
 from dasmccc import (
     DIRECT,
@@ -337,3 +337,82 @@ def test_a_child_of_a_parent_without_an_anchor_keeps_nan_not_zero(caplog):
     assert out["SP"].parent == "S" and np.isnan(out["SP"].anchor_offset)
     assert np.allclose(out["SP"].curve, out["SP"].curve_relative, equal_nan=True)
     assert any("has no anchor; level kept" in r.message for r in caplog.records)
+
+
+def fractional_gather(truth, noise=0.3, seed=3, f0=50.0):
+    """A Ricker evaluated at the fractional arrival ``truth`` of every channel (``make_gather``
+    snaps it to the sample grid), plus Gaussian noise."""
+    rng = np.random.default_rng(seed)
+    t = (np.arange(N)[None, :] - np.asarray(truth)[:, None]) / FS
+    a = (np.pi * f0 * t) ** 2
+    return (1 - 2 * a) * np.exp(-a) + rng.standard_normal((len(truth), N)) * noise
+
+
+def sub_sample_truth(seed=0):
+    """Linear moveout off the sample grid by a random fraction on every channel."""
+    return TRUE + np.random.default_rng(seed).uniform(-0.5, 0.5, N_CH)
+
+
+def spread(curve, truth, edge=20):
+    """Std of the error about its median, fibre ends left out (samples)."""
+    d = (curve - truth)[edge:-edge]
+    return np.std(d - np.median(d))
+
+
+def test_keep_subsample_changes_only_the_curve_by_the_channel_scale_fraction():
+    from dasmccc.ops import moving_avg
+
+    curve = sub_sample_truth() + 10.0
+    curve[100:105] = np.nan
+    x = fractional_gather(sub_sample_truth())
+    off = refine_curve(x, curve, DIRECT)
+    on = refine_curve(x, curve, replace(DIRECT, keep_subsample=True))
+    names = ("aligned", "stack", "coherence", "coherence_local", "coherence_signs")
+    for name in names + ("polarity", "snr", "kept"):
+        np.testing.assert_array_equal(getattr(on, name), getattr(off, name))
+    for a, b in zip(on.taus, off.taus, strict=True):
+        np.testing.assert_array_equal(a, b)
+    assert np.isfinite(off.anchor_offset) and on.anchor_offset == off.anchor_offset
+    # the added term: the fraction (0 on the NaN channels) minus its tau_avg moving average
+    f = np.where(np.isfinite(curve), curve - np.round(curve), 0.0)
+    added = f - moving_avg(f, DIRECT.tau_avg)
+    finite = np.isfinite(curve)
+    assert np.isnan(on.curve[~finite]).all() and np.isfinite(on.curve[finite]).all()
+    assert np.allclose((on.curve - off.curve)[finite], added[finite], rtol=0, atol=1e-9)
+    assert np.allclose(on.shifts - off.shifts, on.curve - off.curve, equal_nan=True)
+
+
+def test_keep_subsample_restores_a_fraction_that_changes_from_channel_to_channel():
+    # the initial curve knows the truth's fraction on every channel but sits 10 samples late
+    truth = sub_sample_truth()
+    x = fractional_gather(truth)
+    curve = truth + 10.0
+    off = refine_curve(x, curve, RefineConfig(anchor=None))
+    on = refine_curve(x, curve, RefineConfig(anchor=None, keep_subsample=True))
+    frac = (curve - np.round(curve))[20:-20]
+    assert 0.2 < spread(off.curve, truth) < 0.4  # uniform rounding: std 1 / sqrt(12) = 0.29
+    assert np.corrcoef((off.curve - truth)[20:-20], frac)[0, 1] < -0.9  # it is the fraction
+    assert spread(on.curve, truth) < 0.1
+
+
+def test_keep_subsample_leaves_out_a_fraction_that_changes_slowly():
+    # a flat stretch of moveout: round(truth) is 400 everywhere and the fraction is a smooth
+    # step that MCCC already measures in tau; adding all of it back would count it twice
+    truth = 400 + 0.45 * np.tanh((np.arange(N_CH) - 149.5) / 15)
+    x = fractional_gather(truth)
+    off = refine_curve(x, truth, RefineConfig(anchor=None))
+    on = refine_curve(x, truth, RefineConfig(anchor=None, keep_subsample=True))
+    whole = truth + np.sum(off.taus, axis=0)  # c + tau: the whole fraction restored
+    assert spread(on.curve, truth) < spread(off.curve, truth) + 0.05
+    assert spread(whole, truth) > spread(off.curve, truth) + 0.2
+
+
+def test_keep_subsample_on_an_integer_curve_changes_nothing(gather):
+    curve = np.round(initial_curve())
+    curve[:20] = np.nan
+    curve[100:105] = np.nan  # interpolated across for the alignment, fractional there
+    off = refine_curve(gather, curve, DIRECT)
+    on = refine_curve(gather, curve, replace(DIRECT, keep_subsample=True))
+    np.testing.assert_array_equal(on.curve, off.curve)
+    with pytest.raises(ValueError, match="keep_subsample needs tau_avg >= 2"):
+        RefineConfig(keep_subsample=True, tau_avg=1)

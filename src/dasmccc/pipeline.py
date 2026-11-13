@@ -13,7 +13,7 @@ import numpy as np
 
 from .anchor import first_lobe, stack_peak
 from .core import iterate_align
-from .ops import shift_arr
+from .ops import moving_avg, shift_arr
 from .polarity import PolarityConfig, PolarityResult, ricker_polarity
 
 log = logging.getLogger("dasmccc")
@@ -105,6 +105,23 @@ class RefineConfig:
                       ``RefineResult.coherence_signs`` records the signs.
     sign_iters      : rounds of the "sign" template (5).
     polarity        : Ricker polarity / SNR / MMAD settings.
+    keep_subsample  : False (default) returns round(curve) + tau. The traces are aligned on
+                      the integer round(curve) and tau is smooth (smoothness, tau_avg), so the
+                      initial curve's fraction f = curve - round(curve) is lost and every
+                      refined pick carries up to +-0.5 samples of rounding. True adds back the
+                      channel-scale part of that fraction, f - moving_avg(f, tau_avg): the part
+                      that changes from channel to channel (a sloping moveout makes f a
+                      sawtooth) is restored; the part that changes slowly along the fibre (a
+                      flat stretch of moveout) is not, because MCCC already measures it in tau
+                      and adding it again would count it twice. The moving average only
+                      approximates what MCCC resolves. Use it when the fraction is a
+                      measurement (picks precise below one sample, in the waveform array's own
+                      sample grid); an integer curve gives the result of False. Needs
+                      tau_avg >= 2. Only ``curve`` and ``shifts`` change; ``aligned``,
+                      ``stack``, the anchor offset and the QC are those of False. In
+                      refine_phases a refined curve feeds the masks, junction, parent choice
+                      and exclude_near of the curves after it, so those can change by more
+                      than the fraction.
     """
 
     window: int = 200
@@ -137,6 +154,7 @@ class RefineConfig:
     coherence_template: str = "plain"
     sign_iters: int = 5
     polarity: PolarityConfig = field(default_factory=PolarityConfig)
+    keep_subsample: bool = False
 
     def __post_init__(self):
         """Refuse settings that cannot run: the per-pair lag bound must fit inside the
@@ -160,6 +178,11 @@ class RefineConfig:
         ):
             raise ValueError(
                 f"pre_mask_taper {self.pre_mask_taper} must lie in [0, pre_mask = {self.pre_mask}]"
+            )
+        if self.keep_subsample and self.tau_avg < 2:
+            raise ValueError(
+                f"keep_subsample needs tau_avg >= 2, got {self.tau_avg}: the restored part "
+                "f - moving_avg(f, tau_avg) is zero without averaging"
             )
 
 
@@ -360,7 +383,8 @@ def refine_curve(
     curve    : (n_channels,) initial arrival in samples; NaN where the phase is not
                picked. The refined range is [first finite, last finite]; interior NaNs are
                linearly interpolated for the alignment only and stay NaN in the output.
-               The fractional part of the curve is dropped (integer alignment).
+               The alignment is integer (round(curve)); the curve's fraction is dropped
+               from the result unless cfg.keep_subsample (see RefineConfig).
     mask     : optional (n_channels, n_samples) bool, True where the waveform is zeroed
                first (used to hide already refined phases).
 
@@ -418,6 +442,12 @@ def refine_curve(
         tau_avg=cfg.tau_avg,
     )
     relative = np.round(c) + total_tau
+    if cfg.keep_subsample:
+        # the channel-scale part of the initial fraction, which the smooth tau cannot carry;
+        # interpolated channels (NaN in the input) are no measurement and count as 0; min
+        # mirrors the clamp in core.solve_tau, which already warned about it
+        frac = np.where(v, c - np.round(c), 0.0)
+        relative = relative + frac - moving_avg(frac, min(cfg.tau_avg, len(frac)))
 
     qc_sub = ricker_polarity(aligned, cfg.polarity)
     stack = _stack(aligned, cfg, qc_sub.polarity)
@@ -512,7 +542,8 @@ def refine_phases(
     would let the child drift there.
 
     ``cfg_by_tag`` defaults to DIRECT for "P" and "S" and SECONDARY for every other tag;
-    entries given override or extend that.
+    entries given override or extend that. Options such as ``keep_subsample`` are per config:
+    set them for every tag that should use them (DIRECT and SECONDARY leave it off).
 
     A curve whose config sets ``exclude_near`` is not refined where its initial curve runs
     within that many samples of a curve refined before it (see RefineConfig). When nothing

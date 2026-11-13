@@ -69,7 +69,10 @@ import line.
   and within a few ms of it for S on the CAPE 2025 fibres, with a per-fibre constant;
   calibrate it per site against a few human picks when onsets are needed.
 * Sub-sample precision: the alignment is integer; tau is a float but the returned curve
-  inherits the integer initial alignment plus the smoothed tau.
+  inherits the integer initial alignment plus the smoothed tau, so the initial curve's
+  fraction is lost. When the initial picks are precise below one sample,
+  `RefineConfig(keep_subsample=True)` adds back the part of the fraction that changes from
+  channel to channel (see docs/algorithm.md, step [4]).
 
 ## Development
 
